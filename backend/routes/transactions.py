@@ -186,3 +186,47 @@ def get_transactions(
         ]
     }
 
+# PATCH /transactions/{id}/category 
+@router.patch("/{transaction_id}/category")
+def update_category(
+    transaction_id: int,
+    request: CategoryUpdateRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Update the category of a specific transaction.
+
+    """
+
+    transaction = db.execute(
+        text("SELECT transaction_id FROM transactions WHERE transaction_id = :id"),
+        {"id": transaction_id}
+    ).fetchone()
+
+    if not transaction:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Transaction {transaction_id} not found"
+        )
+
+    category_id = get_or_create_category(request.category_name, db)
+
+    db.execute(
+        text("""
+            UPDATE transactions
+            SET category_id = :category_id
+            WHERE transaction_id = :transaction_id
+        """),
+        {
+            "category_id"    : category_id,
+            "transaction_id" : transaction_id
+        }
+    )
+    db.commit()
+
+    return {
+        "message"        : "Category updated successfully",
+        "transaction_id" : transaction_id,
+        "new_category"   : request.category_name,
+        "category_id"    : category_id
+    }
