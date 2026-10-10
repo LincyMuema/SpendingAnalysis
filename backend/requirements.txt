@@ -11,3 +11,4 @@ numpy
 joblib
 python-multipart
 python-dotenv
+bcrypt==4.0.1
