@@ -122,3 +122,67 @@ def create_transaction(
         "category_id"    : category_id,
         "category_name"  : request.category_name
     }
+
+# GET /transactions/{user_id} 
+@router.get("/{user_id}")
+def get_transactions(
+    user_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    Get all transactions for a specific user.
+    Returns transactions ordered by date, most recent first.
+    """
+
+    user = db.execute(
+        text("SELECT user_id FROM users WHERE user_id = :user_id"),
+        {"user_id": user_id}
+    ).fetchone()
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User {user_id} not found"
+        )
+
+    transactions = db.execute(
+        text("""
+            SELECT
+                t.transaction_id,
+                t.amount,
+                t.date,
+                t.transaction_type,
+                t.source,
+                t.counterparty,
+                t.is_manual,
+                t.created_at,
+                c.name AS category_name,
+                c.category_id
+            FROM transactions t
+            LEFT JOIN categories c ON t.category_id = c.category_id
+            WHERE t.user_id = :user_id
+            ORDER BY t.date DESC
+        """),
+        {"user_id": user_id}
+    ).fetchall()
+
+    return {
+        "user_id"         : user_id,
+        "transaction_count": len(transactions),
+        "transactions"    : [
+            {
+                "transaction_id"  : t.transaction_id,
+                "amount"          : t.amount,
+                "date"            : str(t.date),
+                "transaction_type": t.transaction_type,
+                "source"          : t.source,
+                "counterparty"    : t.counterparty,
+                "category_name"   : t.category_name,
+                "category_id"     : t.category_id,
+                "is_manual"       : t.is_manual,
+                "created_at"      : str(t.created_at)
+            }
+            for t in transactions
+        ]
+    }
+
