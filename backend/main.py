@@ -47,7 +47,10 @@ async def load_models():
         "kmeans_model",
         "isolation_forest_model",
         "random_forest_model",
+        "scaler_clustering",
         "scaler_prediction",
+        "label_encoder_category",
+        "label_encoder_source",
     ]
 
     for name in model_files:
