@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'api_service.dart';
 import 'home_screen.dart';
-import 'login_screen.dart';
 
 class RegisterScreen extends StatefulWidget {
   const RegisterScreen({super.key});
@@ -61,7 +60,10 @@ class _RegisterScreenState extends State<RegisterScreen> {
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(
-          builder: (_) => HomeScreen(fullName: result['full_name']),
+          builder: (_) => HomeScreen(
+            fullName: result['full_name'],
+            userId: result['user_id'],
+          ),
         ),
       );
     } catch (e) {
@@ -320,10 +322,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   children: [
                     const Text("Already have an account? ", style: TextStyle(color: Colors.black45)),
                     GestureDetector(
-                      onTap: () => Navigator.pushReplacement(
-                        context,
-                        MaterialPageRoute(builder: (_) => const LoginScreen()),
-                      ),
+                      onTap: () => Navigator.pop(context),
                       child: const Text('Sign In', style: TextStyle(color: Color(0xFF5B2EFF), fontWeight: FontWeight.w600)),
                     ),
                   ],
