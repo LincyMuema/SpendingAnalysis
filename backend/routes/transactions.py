@@ -7,9 +7,10 @@ PATCH /transactions/{id}/category — update a transaction category
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from database import get_db
 
@@ -19,16 +20,18 @@ router = APIRouter()
 
 class TransactionRequest(BaseModel):
     user_id          : int
-    amount           : float
+    amount           : float = Field(gt=0)
     date             : str
     transaction_type : Optional[str] = None
     source           : Optional[str] = None
     counterparty     : Optional[str] = None
     category_name    : Optional[str] = "Other"
     is_manual        : Optional[bool] = False
+    reference        : Optional[str] = None   # M-Pesa / Airtel code, used to avoid duplicates
 
 class CategoryUpdateRequest(BaseModel):
     category_name : str
+    apply_to_all  : Optional[bool] = False
 
 def get_or_create_category(category_name: str, db: Session) -> int:
 
@@ -75,7 +78,39 @@ def create_transaction(
             detail=f"User {request.user_id} not found"
         )
 
+    # Skip SMS transactions that were already imported
+    if request.reference:
+        existing = db.execute(
+            text("""
+                SELECT transaction_id FROM transactions
+                WHERE user_id = :user_id AND reference = :reference
+            """),
+            {"user_id": request.user_id, "reference": request.reference}
+        ).fetchone()
+        if existing:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={
+                    "message"        : "Duplicate transaction ignored",
+                    "duplicate"      : True,
+                    "transaction_id" : existing[0]
+                }
+            )
+
     category_id = get_or_create_category(request.category_name, db)
+
+    # For SMS imports, use the category the user chose before for this merchant/person
+    if not request.is_manual and request.counterparty:
+        rule = db.execute(
+            text("""
+                SELECT category_id FROM merchant_rules
+                WHERE user_id = :user_id
+                  AND counterparty = UPPER(TRIM(:counterparty))
+            """),
+            {"user_id": request.user_id, "counterparty": request.counterparty}
+        ).fetchone()
+        if rule:
+            category_id = rule[0]
 
     result = db.execute(
         text("""
@@ -87,7 +122,8 @@ def create_transaction(
                 source,
                 counterparty,
                 category_id,
-                is_manual
+                is_manual,
+                reference
             )
             VALUES (
                 :user_id,
@@ -97,7 +133,8 @@ def create_transaction(
                 :source,
                 :counterparty,
                 :category_id,
-                :is_manual
+                :is_manual,
+                :reference
             )
             RETURNING transaction_id
         """),
@@ -109,7 +146,8 @@ def create_transaction(
             "source"           : request.source,
             "counterparty"     : request.counterparty,
             "category_id"      : category_id,
-            "is_manual"        : request.is_manual
+            "is_manual"        : request.is_manual,
+            "reference"        : request.reference
         }
     )
     db.commit()
@@ -120,7 +158,8 @@ def create_transaction(
         "message"        : "Transaction saved successfully",
         "transaction_id" : transaction_id,
         "category_id"    : category_id,
-        "category_name"  : request.category_name
+        "category_name"  : request.category_name,
+        "duplicate"      : False
     }
 
 # GET /transactions/{user_id} 
@@ -161,7 +200,7 @@ def get_transactions(
             FROM transactions t
             LEFT JOIN categories c ON t.category_id = c.category_id
             WHERE t.user_id = :user_id
-            ORDER BY t.date DESC
+            ORDER BY t.date DESC, t.transaction_id DESC
         """),
         {"user_id": user_id}
     ).fetchall()
@@ -194,10 +233,95 @@ def update_category(
     db: Session = Depends(get_db)
 ):
     """
-    Update the category of a specific transaction.
+    Update the category of a transaction.
 
+    If apply_to_all is true, every transaction from the same merchant/person
+    is updated and the choice is remembered for future SMS imports.
     """
 
+    transaction = db.execute(
+        text("""
+            SELECT transaction_id, user_id, counterparty
+            FROM transactions
+            WHERE transaction_id = :id
+        """),
+        {"id": transaction_id}
+    ).fetchone()
+
+    if not transaction:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Transaction {transaction_id} not found"
+        )
+
+    category_id = get_or_create_category(request.category_name, db)
+    counterparty = (transaction.counterparty or "").strip().upper()
+
+    if request.apply_to_all and counterparty:
+        result = db.execute(
+            text("""
+                UPDATE transactions
+                SET category_id = :category_id
+                WHERE user_id = :user_id
+                  AND UPPER(TRIM(counterparty)) = :counterparty
+            """),
+            {
+                "category_id"  : category_id,
+                "user_id"      : transaction.user_id,
+                "counterparty" : counterparty
+            }
+        )
+        updated_count = result.rowcount
+
+        # Remember the choice for future imports
+        db.execute(
+            text("""
+                INSERT INTO merchant_rules (user_id, counterparty, category_id)
+                VALUES (:user_id, :counterparty, :category_id)
+                ON CONFLICT (user_id, counterparty)
+                DO UPDATE SET category_id = EXCLUDED.category_id
+            """),
+            {
+                "user_id"      : transaction.user_id,
+                "counterparty" : counterparty,
+                "category_id"  : category_id
+            }
+        )
+    else:
+        db.execute(
+            text("""
+                UPDATE transactions
+                SET category_id = :category_id
+                WHERE transaction_id = :transaction_id
+            """),
+            {
+                "category_id"    : category_id,
+                "transaction_id" : transaction_id
+            }
+        )
+        updated_count = 1
+
+    db.commit()
+
+    return {
+        "message"        : "Category updated successfully",
+        "transaction_id" : transaction_id,
+        "new_category"   : request.category_name,
+        "category_id"    : category_id,
+        "updated_count"  : updated_count
+    }
+
+# PATCH /transactions/{id}/dismiss-anomaly
+@router.patch("/{transaction_id}/dismiss-anomaly")
+def dismiss_anomaly(
+    transaction_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    The user confirms a flagged transaction is normal.
+    It will no longer appear in the anomaly list. The stored feedback can
+    also be used as labelled data when the model is retrained.
+    """
     transaction = db.execute(
         text("SELECT transaction_id FROM transactions WHERE transaction_id = :id"),
         {"id": transaction_id}
@@ -209,24 +333,17 @@ def update_category(
             detail=f"Transaction {transaction_id} not found"
         )
 
-    category_id = get_or_create_category(request.category_name, db)
-
     db.execute(
         text("""
             UPDATE transactions
-            SET category_id = :category_id
-            WHERE transaction_id = :transaction_id
+            SET anomaly_dismissed = TRUE
+            WHERE transaction_id = :id
         """),
-        {
-            "category_id"    : category_id,
-            "transaction_id" : transaction_id
-        }
+        {"id": transaction_id}
     )
     db.commit()
 
     return {
-        "message"        : "Category updated successfully",
-        "transaction_id" : transaction_id,
-        "new_category"   : request.category_name,
-        "category_id"    : category_id
+        "message"        : "Transaction marked as not unusual",
+        "transaction_id" : transaction_id
     }
