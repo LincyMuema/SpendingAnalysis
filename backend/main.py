@@ -2,11 +2,13 @@
 SpendingAnalysis — FastAPI backend entry point.
 
 Loads trained ML models at startup and registers all route modules.
-Run locally:
-    uvicorn main:app --reload --port 8000
+Run locally (from the backend folder):
+    python -m uvicorn main:app --reload --port 8000
 
-API documentation available at:
-    http://localhost:8000/docs
+Run on a server (Render sets $PORT):
+    uvicorn main:app --host 0.0.0.0 --port $PORT
+
+API documentation is at /docs on whichever address the server runs.
 """
 
 from fastapi import FastAPI
@@ -75,7 +77,7 @@ def root():
     return {
         "message": "SpendingAnalysis API is running",
         "version": "1.0.0",
-        "docs": "http://localhost:8000/docs"
+        "docs": "/docs"
     }
 
 @app.get("/health")
