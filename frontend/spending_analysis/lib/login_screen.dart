@@ -92,7 +92,7 @@ class _LoginScreenState extends State<LoginScreen> {
 
               // Title
               const Center(
-                child: Text('Welcome back to SpendWise',
+                child: Text('Welcome back to Pesight',
                     textAlign: TextAlign.center,
                     style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.black)),
               ),

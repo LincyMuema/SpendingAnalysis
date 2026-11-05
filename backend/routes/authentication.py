@@ -1,7 +1,10 @@
 """
 Authentication routes — register and login.
-POST /auth/register — create a new user account
-POST /auth/login — authenticate and return a token
+POST /authentication/register - create a new user account and return a token
+POST /authentication/login    - authenticate and return a token
+
+The token is sent by the app with every other request
+(Authorization: Bearer <token>) and checked in security.py.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -9,21 +12,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
-from jose import jwt
-from datetime import datetime, timedelta
 from database import get_db
-from dotenv import load_dotenv
-import os
-
-load_dotenv()
+from security import create_token
 
 router = APIRouter()
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-SECRET_KEY                = os.getenv("SECRET_KEY")
-ALGORITHM                 = os.getenv("ALGORITHM")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
 
 # Request and response shapes
 class RegisterRequest(BaseModel):
@@ -48,19 +42,12 @@ def hash_password(password: str) -> str:
 def verify_password(plain: str, hashed: str) -> bool:
     return pwd_context.verify(plain, hashed)
 
-def create_token(user_id: int) -> str:
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    payload = {
-        "sub" : str(user_id),
-        "exp" : expire
-    }
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-
 # POST /auth/register 
 @router.post("/register", response_model=AuthResponse)
 def register(request: RegisterRequest, db: Session = Depends(get_db)):
+    request.email = request.email.strip().lower()
     existing = db.execute(
-        text("SELECT user_id FROM users WHERE email = :email"),
+        text("SELECT user_id FROM users WHERE LOWER(email) = :email"),
         {"email": request.email}
     ).fetchone()
 
@@ -102,12 +89,13 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     """
     Authenticate an existing user.
     """
+    request.email = request.email.strip().lower()
 
     user = db.execute(
         text("""
             SELECT user_id, full_name, password_hash
             FROM users
-            WHERE email = :email
+            WHERE LOWER(email) = :email
         """),
         {"email": request.email}
     ).fetchone()

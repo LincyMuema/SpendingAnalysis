@@ -4,6 +4,10 @@ Transaction routes.
 POST /transactions — a new transaction
 GET  /transactions/{user_id}   — get all transactions for a user
 PATCH /transactions/{id}/category — update a transaction category
+PATCH /transactions/{id}/dismiss-anomaly — mark a flagged transaction as normal
+
+Every endpoint requires a login token. The user is taken from the token,
+so a user can only read or change their own transactions.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -13,13 +17,14 @@ from sqlalchemy import text
 from pydantic import BaseModel, Field
 from typing import Optional
 from database import get_db
+from security import get_current_user_id, require_same_user
 
 router = APIRouter()
 
 # Request and response shapes 
 
 class TransactionRequest(BaseModel):
-    user_id          : int
+    user_id          : Optional[int] = None   # ignored; the user comes from the login token
     amount           : float = Field(gt=0)
     date             : str
     transaction_type : Optional[str] = None
@@ -58,7 +63,8 @@ def get_or_create_category(category_name: str, db: Session) -> int:
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_transaction(
     request: TransactionRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id),
 ):
     """
     Save a new transaction to the database.
@@ -67,6 +73,8 @@ def create_transaction(
     - A new M-Pesa or bank card SMS is parsed
     - The user manually adds a cash or wallet transaction
     """
+    request.user_id = current_user_id
+
     user = db.execute(
         text("SELECT user_id FROM users WHERE user_id = :user_id"),
         {"user_id": request.user_id}
@@ -166,12 +174,14 @@ def create_transaction(
 @router.get("/{user_id}")
 def get_transactions(
     user_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id),
 ):
     """
     Get all transactions for a specific user.
     Returns transactions ordered by date, most recent first.
     """
+    require_same_user(user_id, current_user_id)
 
     user = db.execute(
         text("SELECT user_id FROM users WHERE user_id = :user_id"),
@@ -230,7 +240,8 @@ def get_transactions(
 def update_category(
     transaction_id: int,
     request: CategoryUpdateRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id),
 ):
     """
     Update the category of a transaction.
@@ -243,9 +254,9 @@ def update_category(
         text("""
             SELECT transaction_id, user_id, counterparty
             FROM transactions
-            WHERE transaction_id = :id
+            WHERE transaction_id = :id AND user_id = :user_id
         """),
-        {"id": transaction_id}
+        {"id": transaction_id, "user_id": current_user_id}
     ).fetchone()
 
     if not transaction:
@@ -292,11 +303,12 @@ def update_category(
             text("""
                 UPDATE transactions
                 SET category_id = :category_id
-                WHERE transaction_id = :transaction_id
+                WHERE transaction_id = :transaction_id AND user_id = :user_id
             """),
             {
                 "category_id"    : category_id,
-                "transaction_id" : transaction_id
+                "transaction_id" : transaction_id,
+                "user_id"        : current_user_id
             }
         )
         updated_count = 1
@@ -315,7 +327,8 @@ def update_category(
 @router.patch("/{transaction_id}/dismiss-anomaly")
 def dismiss_anomaly(
     transaction_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id),
 ):
     """
     The user confirms a flagged transaction is normal.
@@ -323,8 +336,8 @@ def dismiss_anomaly(
     also be used as labelled data when the model is retrained.
     """
     transaction = db.execute(
-        text("SELECT transaction_id FROM transactions WHERE transaction_id = :id"),
-        {"id": transaction_id}
+        text("SELECT transaction_id FROM transactions WHERE transaction_id = :id AND user_id = :user_id"),
+        {"id": transaction_id, "user_id": current_user_id}
     ).fetchone()
 
     if not transaction:
@@ -337,9 +350,9 @@ def dismiss_anomaly(
         text("""
             UPDATE transactions
             SET anomaly_dismissed = TRUE
-            WHERE transaction_id = :id
+            WHERE transaction_id = :id AND user_id = :user_id
         """),
-        {"id": transaction_id}
+        {"id": transaction_id, "user_id": current_user_id}
     )
     db.commit()
 

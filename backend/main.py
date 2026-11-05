@@ -1,5 +1,5 @@
 """
-SpendingAnalysis — FastAPI backend entry point.
+Pesight — FastAPI backend entry point.
 
 Loads trained ML models at startup and registers all route modules.
 Run locally (from the backend folder):
@@ -22,7 +22,7 @@ load_dotenv()
 
 # ── Application setup ─────────────────────────────────────────
 app = FastAPI(
-    title="SpendingAnalysis API",
+    title="Pesight API",
     description="Personal Spending Analysis and Optimization System",
     version="1.0.0"
 )
@@ -75,7 +75,7 @@ async def load_models():
 def root():
     """Root endpoint — confirms the API is running."""
     return {
-        "message": "SpendingAnalysis API is running",
+        "message": "Pesight API is running",
         "version": "1.0.0",
         "docs": "/docs"
     }

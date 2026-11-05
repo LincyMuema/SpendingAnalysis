@@ -250,7 +250,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
                         text: const TextSpan(
                           style: TextStyle(color: Colors.black54, fontSize: 12),
                           children: [
-                            TextSpan(text: "I agree to SpendWise's "),
+                            TextSpan(text: "I agree to Pesight's "),
                             TextSpan(text: 'Terms of Service', style: TextStyle(color: Color(0xFF5B2EFF))),
                             TextSpan(text: ' and acknowledge our '),
                             TextSpan(text: 'Privacy Policy', style: TextStyle(color: Color(0xFF5B2EFF))),
