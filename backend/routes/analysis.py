@@ -15,6 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from database import get_db
+from security import get_current_user_id, require_same_user
 from main import models
 
 
@@ -99,7 +100,7 @@ def fetch_user_transactions(user_id: int, db: Session) -> pd.DataFrame:
             FROM transactions t
             LEFT JOIN categories c ON t.category_id = c.category_id
             WHERE t.user_id = :user_id
-            ORDER BY t.date ASC
+            ORDER BY t.date ASC, t.transaction_id ASC
             """
         ),
         {"user_id": user_id},
@@ -129,7 +130,9 @@ def fetch_user_transactions(user_id: int, db: Session) -> pd.DataFrame:
 
     df = df.dropna(subset=["date", "amount"])
     df = df[df["amount"] > 0].copy()
-    df = df.sort_values("date").reset_index(drop=True)
+    # Same-day transactions are kept in the order they were recorded, so the
+    # results do not change when rows are updated (e.g. an anomaly is dismissed).
+    df = df.sort_values(["date", "transaction_id"], kind="mergesort").reset_index(drop=True)
 
     return df
 
@@ -629,12 +632,17 @@ def generate_insights_and_recommendations(
 # ── API route ────────────────────────────────────────────────────────────────
 
 @router.get("/{user_id}")
-def analyse_user(user_id: int, db: Session = Depends(get_db)):
+def analyse_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id),
+):
     """
     Run the full analysis pipeline for one user.
     At least five transactions are required for the overall analysis.
     Forecasting has a separate minimum of four observed weeks.
     """
+    require_same_user(user_id, current_user_id)
     user = db.execute(
         text("SELECT user_id FROM users WHERE user_id = :user_id"),
         {"user_id": user_id},
