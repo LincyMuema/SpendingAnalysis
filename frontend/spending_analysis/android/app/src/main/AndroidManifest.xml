@@ -3,7 +3,7 @@
     <uses-permission android:name="android.permission.READ_SMS"/>
 
     <application
-        android:label="spending_analysis"
+        android:label="Pesight"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

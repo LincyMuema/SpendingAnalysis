@@ -281,7 +281,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('SpendWiser  •  version 1.0.0',
+                  Text('Pesight  •  version 1.0.0',
                       style: TextStyle(
                           color: Color(0xFF1A1A2E),
                           fontWeight: FontWeight.w600,
