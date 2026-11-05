@@ -50,6 +50,13 @@ DB_TO_TRAINING_CATEGORY = {
 }
 FALLBACK_CATEGORY = "Groceries"
 
+# Anomaly display rules (applied after the Isolation Forest, no retraining).
+# The first days of a user's history have no baseline, so every category
+# looks "new" and every amount looks unusual. Scores just below zero are
+# borderline, so only clearer cases are shown.
+ANOMALY_WARMUP_DAYS = 14
+ANOMALY_SCORE_CUTOFF = -0.03
+
 SOURCE_MAP = {
     "CARD": 0,
     "CASH": 1,
@@ -141,7 +148,7 @@ def add_transaction_features(df: pd.DataFrame) -> pd.DataFrame:
     df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
 
     # These rolling features use only earlier transactions, not the current one.
-    df = df.sort_values("date").reset_index(drop=True)
+    df = df.sort_values("date", kind="mergesort").reset_index(drop=True)
     date_indexed_amounts = df.set_index("date")["amount"]
 
     df["7day_spend"] = (
@@ -157,6 +164,22 @@ def add_transaction_features(df: pd.DataFrame) -> pd.DataFrame:
     df["spending_velocity"] = (
         df["amount"] / df["30day_avg"].replace(0, np.nan)
     ).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+
+    # Category behaviour features. They describe how this user uses a category,
+    # not which category it is, so they work for ANY category (including
+    # categories a user creates). Only earlier transactions are used.
+    prior_total = np.arange(len(df))                                   # transactions before this one
+    prior_in_cat = df.groupby("category_name").cumcount().to_numpy()   # earlier ones in this category
+    df["cat_share"] = np.where(prior_total > 0, prior_in_cat / np.maximum(prior_total, 1), 0.0)
+
+    prev_cat_mean = df.groupby("category_name")["amount"].transform(
+        lambda s: s.expanding().mean().shift(1)
+    )
+    df["cat_amount_ratio"] = (
+        df["amount"] / prev_cat_mean.replace(0, np.nan)
+    ).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+
+    df["is_new_category"] = (prior_in_cat == 0).astype(int)
 
     return df
 
@@ -217,9 +240,12 @@ def run_clustering(df: pd.DataFrame) -> dict:
     kmeans = models["kmeans_model"]
     scaler = models["scaler_clustering"]
 
+    # Must match features_clustering in the training notebook (same order)
     clustering_features = [
         "amount",
-        "category_encoded",
+        "cat_share",
+        "cat_amount_ratio",
+        "is_new_category",
         "day_of_week",
         "week_of_month",
         "is_weekend",
@@ -278,9 +304,15 @@ def run_anomaly_detection(df: pd.DataFrame) -> dict:
     """Flag transactions that the trained Isolation Forest considers unusual."""
     iso_forest = models["isolation_forest_model"]
 
+    # Must match the feature set the training notebook selected (same order).
+    # If the notebook printed "Using: CURRENT", replace this list with:
+    #   ["amount", "category_encoded", "source_encoded", "day_of_week",
+    #    "is_weekend", "spending_velocity"]
     anomaly_features = [
         "amount",
-        "category_encoded",
+        "cat_share",
+        "cat_amount_ratio",
+        "is_new_category",
         "source_encoded",
         "day_of_week",
         "is_weekend",
@@ -298,7 +330,15 @@ def run_anomaly_detection(df: pd.DataFrame) -> dict:
 
     # Skip transactions the user has confirmed are normal
     dismissed = featured_df["anomaly_dismissed"].fillna(False).astype(bool)
-    anomalies = featured_df[(featured_df["anomaly_flag"] == -1) & ~dismissed].copy()
+
+    # Skip the warm-up period and borderline scores
+    warmup_end = featured_df["date"].min() + pd.Timedelta(days=ANOMALY_WARMUP_DAYS)
+    after_warmup = featured_df["date"] >= warmup_end
+    clear_case = featured_df["anomaly_score"] < ANOMALY_SCORE_CUTOFF
+
+    anomalies = featured_df[
+        (featured_df["anomaly_flag"] == -1) & clear_case & after_warmup & ~dismissed
+    ].copy()
     anomaly_rate = (len(anomalies) / len(featured_df) * 100) if len(featured_df) else 0
 
     anomaly_list = sorted(
@@ -536,7 +576,7 @@ def generate_insights_and_recommendations(
             recommendations.append(
                 f"Your most unusual transaction is KSh {top['amount']:,.0f} "
                 f"spent on {top['category']} on {top['date']}. "
-                f"Check your alerts to confirm this was you."
+                f"Check the Anomalies tab to confirm this was you."
             )
 
     # ── Forecast ──────────────────────────────────────────────────────────
