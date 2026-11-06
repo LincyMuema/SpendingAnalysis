@@ -38,11 +38,23 @@ class CategoryUpdateRequest(BaseModel):
     category_name : str
     apply_to_all  : Optional[bool] = False
 
-def get_or_create_category(category_name: str, db: Session) -> int:
+def get_or_create_category(category_name: str, user_id: int, db: Session) -> int:
+    """
+    Find a category by name among the standard categories and this user's own
+    categories. If it does not exist, create it as one of the user's own
+    categories (other users do not see it).
+    """
+    name = (category_name or "Other").strip()[:50] or "Other"
 
     result = db.execute(
-        text("SELECT category_id FROM categories WHERE name = :name"),
-        {"name": category_name}
+        text("""
+            SELECT category_id FROM categories
+            WHERE LOWER(name) = LOWER(:name)
+              AND (user_id IS NULL OR user_id = :user_id)
+            ORDER BY user_id NULLS FIRST
+            LIMIT 1
+        """),
+        {"name": name, "user_id": user_id}
     ).fetchone()
 
     if result:
@@ -50,11 +62,11 @@ def get_or_create_category(category_name: str, db: Session) -> int:
 
     new_cat = db.execute(
         text("""
-            INSERT INTO categories (name, icon)
-            VALUES (:name, :icon)
+            INSERT INTO categories (name, icon, user_id)
+            VALUES (:name, :icon, :user_id)
             RETURNING category_id
         """),
-        {"name": category_name, "icon": "📦"}
+        {"name": name, "icon": "📦", "user_id": user_id}
     )
     db.commit()
     return new_cat.fetchone()[0]
@@ -105,7 +117,7 @@ def create_transaction(
                 }
             )
 
-    category_id = get_or_create_category(request.category_name, db)
+    category_id = get_or_create_category(request.category_name, current_user_id, db)
 
     # For SMS imports, use the category the user chose before for this merchant/person
     if not request.is_manual and request.counterparty:
@@ -265,7 +277,7 @@ def update_category(
             detail=f"Transaction {transaction_id} not found"
         )
 
-    category_id = get_or_create_category(request.category_name, db)
+    category_id = get_or_create_category(request.category_name, current_user_id, db)
     counterparty = (transaction.counterparty or "").strip().upper()
 
     if request.apply_to_all and counterparty:

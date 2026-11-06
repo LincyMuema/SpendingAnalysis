@@ -28,7 +28,9 @@ class _LoginScreenState extends State<LoginScreen> {
       final result = await ApiService.login(
         email: _emailController.text.trim(),
         password: _passwordController.text,
+        rememberMe: _remember,
       );
+      if (!mounted) return;
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(
@@ -40,11 +42,12 @@ class _LoginScreenState extends State<LoginScreen> {
         ),
       );
     } catch (e) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(e.toString().replaceAll('Exception: ', ''))),
       );
     } finally {
-      setState(() => _isLoading = false);
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -154,6 +157,11 @@ class _LoginScreenState extends State<LoginScreen> {
                   ),
                   const Text('Remember device',
                       style: TextStyle(color: Colors.black54, fontSize: 13)),
+                  const SizedBox(width: 4),
+                  const Tooltip(
+                    message: 'Stay logged in on this phone for 30 days',
+                    child: Icon(Icons.info_outline, size: 16, color: Colors.black38),
+                  ),
                 ],
               ),
               const SizedBox(height: 20),
@@ -182,28 +190,6 @@ class _LoginScreenState extends State<LoginScreen> {
                         ],
                       ),
               ),
-              const SizedBox(height: 12),
-
-              // Biometrics button
-              OutlinedButton(
-                style: OutlinedButton.styleFrom(
-                  minimumSize: const Size(double.infinity, 48),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                  side: const BorderSide(color: Colors.black12),
-                  backgroundColor: Colors.white,
-                  foregroundColor: const Color(0xFF5B2EFF),
-                ),
-                onPressed: () {},
-                child: const Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.fingerprint, size: 20),
-                    SizedBox(width: 8),
-                    Text('Sign in with Face ID / Biometrics',
-                        style: TextStyle(fontWeight: FontWeight.w500, fontSize: 13)),
-                  ],
-                ),
-              ),
               const SizedBox(height: 20),
 
               // Or continue with
@@ -220,7 +206,9 @@ class _LoginScreenState extends State<LoginScreen> {
                   side: const BorderSide(color: Colors.black12),
                   backgroundColor: Colors.white,
                 ),
-                onPressed: () {},
+                onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Google sign-in is coming soon')),
+                ),
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [

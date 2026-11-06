@@ -3,7 +3,9 @@ import 'api_service.dart';
 import 'sms_sync_service.dart';
 import 'app_events.dart';
 
-// These match the names in the database categories table exactly.
+// Standard categories shown in the pickers. These match the names in the
+// database categories table exactly. The user's own categories are added
+// to these at run time (see _loadCategories).
 const List<String> kCategories = [
   'Food & Dining',
   'Transport',
@@ -16,6 +18,9 @@ const List<String> kCategories = [
 ];
 
 const List<String> kSources = ['MPESA', 'CARD', 'CASH', 'WALLET'];
+
+// Special dropdown value that opens the "New category" dialog
+const String _kNewCategory = '__new_category__';
 
 const List<String> _months = [
   'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
@@ -38,6 +43,141 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
   String? _error;
   bool _isSyncing = false;
 
+  // ── Categories (standard + the user's own) ────────────────────────────────
+  final Map<String, int> _customCategoryIds = {}; // name -> category_id
+
+  List<String> get _categories => [
+        ...kCategories,
+        ..._customCategoryIds.keys.where((c) => !kCategories.contains(c)),
+      ];
+
+  Future<void> _loadCategories() async {
+    try {
+      final cats = await ApiService.getCategories();
+      if (!mounted) return;
+      setState(() {
+        _customCategoryIds
+          ..clear()
+          ..addEntries(cats
+              .where((c) => c['is_custom'] == true)
+              .map((c) => MapEntry(c['name'] as String, c['category_id'] as int)));
+      });
+    } catch (_) {
+      // Keep the standard categories if this fails
+    }
+  }
+
+  /// Asks for a new category name and creates it. Returns the name, or null.
+  Future<String?> _createCategoryDialog(BuildContext ctx) async {
+    final nameCtrl = TextEditingController();
+    String? error;
+    bool saving = false;
+
+    return showDialog<String>(
+      context: ctx,
+      builder: (dCtx) => StatefulBuilder(
+        builder: (dCtx, setDialog) {
+          Future<void> create() async {
+            final name = nameCtrl.text.trim();
+            if (name.isEmpty) {
+              setDialog(() => error = 'Enter a name, e.g. Church or Chama');
+              return;
+            }
+            setDialog(() {
+              saving = true;
+              error = null;
+            });
+            try {
+              final cat = await ApiService.createCategory(name: name);
+              if (mounted) {
+                setState(() => _customCategoryIds[cat['name'] as String] =
+                    cat['category_id'] as int);
+              }
+              if (dCtx.mounted) Navigator.pop(dCtx, cat['name'] as String);
+            } catch (e) {
+              setDialog(() {
+                saving = false;
+                error = e.toString().replaceAll('Exception: ', '');
+              });
+            }
+          }
+
+          return AlertDialog(
+            backgroundColor: Colors.white,
+            title: const Text('New category'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: nameCtrl,
+                  autofocus: true,
+                  maxLength: 30,
+                  textCapitalization: TextCapitalization.words,
+                  decoration: _inputStyle('Category name'),
+                  onSubmitted: (_) => saving ? null : create(),
+                ),
+                if (error != null)
+                  Text(error!,
+                      style: const TextStyle(color: Color(0xFFE53935), fontSize: 13)),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dCtx),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: saving ? null : create,
+                child: const Text('Create'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// Deletes one of the user's own categories; its transactions move to Other.
+  Future<bool> _confirmDeleteCategory(BuildContext ctx, String name) async {
+    final id = _customCategoryIds[name];
+    if (id == null) return false;
+    final ok = await showDialog<bool>(
+      context: ctx,
+      builder: (dCtx) => AlertDialog(
+        backgroundColor: Colors.white,
+        title: Text('Delete "$name"?'),
+        content: const Text(
+            'Transactions in this category will move to Other. This cannot be undone.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dCtx, false), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(dCtx, true),
+            child: const Text('Delete', style: TextStyle(color: Color(0xFFE53935))),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return false;
+    try {
+      final msg = await ApiService.deleteCategory(categoryId: id);
+      if (mounted) setState(() => _customCategoryIds.remove(name));
+      await _loadTransactions(silent: true);
+      AppEvents.notifyTransactionsChanged();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+      }
+      return true;
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.toString().replaceAll('Exception: ', ''))),
+        );
+      }
+      return false;
+    }
+  }
+
   // ── Filters ────────────────────────────────────────────────────────────────
   Set<String> _fCategories = {};
   Set<String> _fSources = {};
@@ -48,6 +188,7 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
   @override
   void initState() {
     super.initState();
+    _loadCategories();
     _loadTransactions().then((_) => _autoSync());
   }
 
@@ -263,7 +404,7 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
 
     // Standard categories first, then any older ones already in the data.
     final catOptions = <String>{
-      ...kCategories,
+      ..._categories,
       ..._transactions.map((t) => (t['category_name'] as String?) ?? 'Other'),
     }.toList();
 
@@ -569,14 +710,31 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
                   ),
                   const SizedBox(height: 12),
                   DropdownButtonFormField<String>(
+                    // The key makes the field reset if "+ New category" is cancelled
+                    key: ValueKey('$category-${_categories.length}'),
                     value: category,
                     dropdownColor: Colors.white,
                     style: const TextStyle(color: Color(0xFF1A1A2E)),
                     decoration: _inputStyle('Category'),
-                    items: kCategories
-                        .map((c) => DropdownMenuItem(value: c, child: Text(c)))
-                        .toList(),
-                    onChanged: (v) => setModal(() => category = v!),
+                    items: [
+                      ..._categories
+                          .map((c) => DropdownMenuItem(value: c, child: Text(c))),
+                      const DropdownMenuItem(
+                        value: _kNewCategory,
+                        child: Text('+ New category',
+                            style: TextStyle(
+                                color: Color(0xFF5B2EFF),
+                                fontWeight: FontWeight.w600)),
+                      ),
+                    ],
+                    onChanged: (v) async {
+                      if (v == _kNewCategory) {
+                        final created = await _createCategoryDialog(ctx);
+                        setModal(() => category = created ?? category);
+                      } else {
+                        setModal(() => category = v!);
+                      }
+                    },
                   ),
                   const SizedBox(height: 12),
                   DropdownButtonFormField<String>(
@@ -667,7 +825,6 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
     bool saving = false;
     String? error;
 
-    final options = <String>{...kCategories, selected}.toList();
 
     showModalBottomSheet(
       context: context,
@@ -735,16 +892,48 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
                   Wrap(
                     spacing: 8,
                     runSpacing: 4,
-                    children: options.map((c) {
-                      return ChoiceChip(
-                        label: Text(c),
-                        selected: selected == c,
-                        selectedColor:
-                            const Color(0xFF5B2EFF).withOpacity(0.15),
-                        onSelected: (_) => setModal(() => selected = c),
-                      );
-                    }).toList(),
+                    children: [
+                      ...<String>{..._categories, selected}.map((c) {
+                        final isCustom = _customCategoryIds.containsKey(c);
+                        return GestureDetector(
+                          // Long-press one of your own categories to delete it
+                          onLongPress: isCustom
+                              ? () async {
+                                  final deleted = await _confirmDeleteCategory(ctx, c);
+                                  if (deleted) {
+                                    setModal(() {
+                                      if (selected == c) selected = 'Other';
+                                    });
+                                  }
+                                }
+                              : null,
+                          child: ChoiceChip(
+                            label: Text(c),
+                            selected: selected == c,
+                            selectedColor:
+                                const Color(0xFF5B2EFF).withOpacity(0.15),
+                            onSelected: (_) => setModal(() => selected = c),
+                          ),
+                        );
+                      }),
+                      ActionChip(
+                        avatar: const Icon(Icons.add, size: 16, color: Color(0xFF5B2EFF)),
+                        label: const Text('New',
+                            style: TextStyle(color: Color(0xFF5B2EFF))),
+                        backgroundColor: Colors.white,
+                        side: const BorderSide(color: Color(0xFF5B2EFF)),
+                        onPressed: () async {
+                          final created = await _createCategoryDialog(ctx);
+                          if (created != null) setModal(() => selected = created);
+                        },
+                      ),
+                    ],
                   ),
+                  if (_customCategoryIds.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    const Text('Tip: long-press one of your own categories to delete it.',
+                        style: TextStyle(color: Colors.black38, fontSize: 11)),
+                  ],
                   if (counterparty.isNotEmpty) ...[
                     const SizedBox(height: 12),
                     CheckboxListTile(

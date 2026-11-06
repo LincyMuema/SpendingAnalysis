@@ -2,14 +2,26 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'app_events.dart';
 
 class ApiService {
   static String get _baseUrl =>
       dotenv.env['API_BASE_URL'] ?? 'http://192.168.100.3:8000';
 
   // ── Login token ─────────────────────────────────────────────────────────────
-  // Kept in memory only: it is cleared when the app closes or the user logs out.
+  // Kept in memory while the app is open. If "Remember device" was ticked,
+  // it is also saved in the phone's encrypted storage so the user stays
+  // logged in after closing the app.
   static String? _token;
+
+  static const _storage = FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+  );
+  static const _kToken = 'pesight_token';
+  static const _kUserId = 'pesight_user_id';
+  static const _kName = 'pesight_full_name';
+  static const _kEmail = 'pesight_email';
 
   /// Set in main.dart so the app can return to the login screen
   /// when the session expires.
@@ -18,7 +30,62 @@ class ApiService {
 
   static bool get isLoggedIn => _token != null;
 
-  static void logout() => _token = null;
+  /// Clears the token from memory and from the phone.
+  static Future<void> logout() async {
+    _token = null;
+    AppEvents.fullName.value = null; // forget the previous user's name
+    try {
+      await _storage.deleteAll();
+    } catch (_) {}
+  }
+
+  static Future<void> _saveSession(Map<String, dynamic> data, String email) async {
+    await _storage.write(key: _kToken, value: data['token'] as String);
+    await _storage.write(key: _kUserId, value: '${data['user_id']}');
+    await _storage.write(key: _kName, value: data['full_name'] as String);
+    await _storage.write(key: _kEmail, value: email);
+  }
+
+  /// Called when the app opens. Returns the saved user (user_id, full_name,
+  /// email) if this device was remembered and the session is still valid,
+  /// otherwise null.
+  static Future<Map<String, dynamic>?> restoreSession() async {
+    String? token;
+    try {
+      token = await _storage.read(key: _kToken);
+    } catch (_) {
+      return null;
+    }
+    if (token == null) return null;
+
+    final saved = {
+      'user_id': int.tryParse(await _storage.read(key: _kUserId) ?? ''),
+      'full_name': await _storage.read(key: _kName) ?? '',
+      'email': await _storage.read(key: _kEmail),
+    };
+    if (saved['user_id'] == null) return null;
+
+    try {
+      // The free server can take up to a minute to wake up
+      final response = await http
+          .get(Uri.parse('$_baseUrl/authentication/me'),
+              headers: {'Authorization': 'Bearer $token'})
+          .timeout(const Duration(seconds: 75));
+      if (response.statusCode == 200) {
+        _token = token;
+        return Map<String, dynamic>.from(_decode(response));
+      }
+      if (response.statusCode == 401) {
+        await logout(); // expired: ask the user to log in again
+        return null;
+      }
+    } catch (_) {
+      // No internet or server asleep: open with the saved details; the
+      // screens will load data once the server responds.
+    }
+    _token = token;
+    return saved;
+  }
 
   static Map<String, String> get _headers => {
         'Content-Type': 'application/json',
@@ -42,7 +109,7 @@ class ApiService {
     if (ok.contains(response.statusCode)) return data;
 
     if (response.statusCode == 401) {
-      _token = null;
+      logout();
       final nav = navigatorKey?.currentState;
       if (nav != null && loginScreenBuilder != null) {
         nav.pushAndRemoveUntil(
@@ -74,6 +141,7 @@ class ApiService {
     );
     final data = _decode(response);
     if (response.statusCode == 200) {
+      await logout(); // clear any previously remembered account
       _token = data['token'];
       return data; // has: message, user_id, full_name, token
     }
@@ -84,15 +152,29 @@ class ApiService {
   static Future<Map<String, dynamic>> login({
     required String email,
     required String password,
+    bool rememberMe = false,
   }) async {
     final response = await http.post(
       Uri.parse('$_baseUrl/authentication/login'),
       headers: _headers,
-      body: jsonEncode({'email': email, 'password': password}),
+      body: jsonEncode({
+        'email': email,
+        'password': password,
+        'remember_me': rememberMe,
+      }),
     );
     final data = _decode(response);
     if (response.statusCode == 200) {
+      AppEvents.fullName.value = null;
       _token = data['token'];
+      if (rememberMe) {
+        try {
+          await _saveSession(data, email);
+        } catch (_) {} // still logged in for this session
+      } else {
+        await logout();
+        _token = data['token'];
+      }
       return data; // has: message, user_id, full_name, token
     }
     throw Exception(data['detail'] ?? 'Login failed');
@@ -111,11 +193,13 @@ class ApiService {
   }
 
   // ── Get Analysis ───────────────────────────────────────────────────────────
+  /// [days] is the period described (habits, categories, insights).
   static Future<Map<String, dynamic>> getAnalysis({
     required int userId,
+    int days = 90,
   }) async {
     final response = await http.get(
-      Uri.parse('$_baseUrl/analysis/$userId'),
+      Uri.parse('$_baseUrl/analysis/$userId?days=$days'),
       headers: _headers,
     );
     return Map<String, dynamic>.from(
@@ -179,5 +263,89 @@ class ApiService {
       headers: _headers,
     );
     _check(response, 'Failed to update transaction');
+  }
+
+  // ── Categories ──────────────────────────────────────────────────────────────
+  /// Standard categories plus the user's own. Each item has
+  /// category_id, name, icon and is_custom.
+  static Future<List<Map<String, dynamic>>> getCategories() async {
+    final response = await http.get(
+      Uri.parse('$_baseUrl/categories/'),
+      headers: _headers,
+    );
+    final data = _check(response, 'Failed to load categories');
+    return List<Map<String, dynamic>>.from(data['categories']);
+  }
+
+  static Future<Map<String, dynamic>> createCategory({required String name}) async {
+    final response = await http.post(
+      Uri.parse('$_baseUrl/categories/'),
+      headers: _headers,
+      body: jsonEncode({'name': name}),
+    );
+    final data = _check(response, 'Failed to create category', ok: const [201]);
+    return Map<String, dynamic>.from(data['category']);
+  }
+
+  static Future<String> deleteCategory({required int categoryId}) async {
+    final response = await http.delete(
+      Uri.parse('$_baseUrl/categories/$categoryId'),
+      headers: _headers,
+    );
+    final data = _check(response, 'Failed to delete category');
+    return (data['message'] as String?) ?? 'Category deleted';
+  }
+
+  // ── Profile ────────────────────────────────────────────────────────────────
+  /// user_id, full_name, email, phone, member_since
+  static Future<Map<String, dynamic>> getProfile() async {
+    final response = await http.get(
+      Uri.parse('$_baseUrl/authentication/me'),
+      headers: _headers,
+    );
+    return Map<String, dynamic>.from(_check(response, 'Failed to load profile'));
+  }
+
+  /// Only the fields given are changed. Returns the updated profile.
+  static Future<Map<String, dynamic>> updateProfile({
+    String? fullName,
+    String? email,
+    String? phone,
+  }) async {
+    final response = await http.patch(
+      Uri.parse('$_baseUrl/authentication/me'),
+      headers: _headers,
+      body: jsonEncode({
+        if (fullName != null) 'full_name': fullName,
+        if (email != null) 'email': email,
+        if (phone != null) 'phone': phone,
+      }),
+    );
+    final data = _check(response, 'Failed to update profile');
+    final profile = Map<String, dynamic>.from(data['profile']);
+
+    // Keep the remembered details in step with the new name/email
+    try {
+      if (await _storage.read(key: _kToken) != null) {
+        await _storage.write(key: _kName, value: profile['full_name'] as String);
+        await _storage.write(key: _kEmail, value: profile['email'] as String);
+      }
+    } catch (_) {}
+    return profile;
+  }
+
+  static Future<void> changePassword({
+    required String currentPassword,
+    required String newPassword,
+  }) async {
+    final response = await http.post(
+      Uri.parse('$_baseUrl/authentication/change-password'),
+      headers: _headers,
+      body: jsonEncode({
+        'current_password': currentPassword,
+        'new_password': newPassword,
+      }),
+    );
+    _check(response, 'Failed to change password');
   }
 }

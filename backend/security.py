@@ -20,6 +20,8 @@ load_dotenv()
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 1440))
+# Used when the user ticks "Remember device" at login
+REMEMBER_ME_DAYS = int(os.getenv("REMEMBER_ME_DAYS", 30))
 
 if not SECRET_KEY:
     raise RuntimeError("SECRET_KEY not set. Add it to the .env file (or Render environment).")
@@ -28,8 +30,9 @@ if not SECRET_KEY:
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
-def create_token(user_id: int) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+def create_token(user_id: int, remember: bool = False) -> str:
+    lifetime = timedelta(days=REMEMBER_ME_DAYS) if remember else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.now(timezone.utc) + lifetime
     payload = {"sub": str(user_id), "exp": expire}
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 

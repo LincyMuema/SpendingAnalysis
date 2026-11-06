@@ -25,7 +25,11 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     _screens = [
-      _HomeBody(fullName: widget.fullName, userId: widget.userId),
+      _HomeBody(
+        fullName: widget.fullName,
+        userId: widget.userId,
+        onOpenProfile: () => setState(() => _selectedIndex = 3),
+      ),
       TransactionsScreen(userId: widget.userId, ownName: widget.fullName),
       AnalysisScreen(userId: widget.userId),
       ProfileScreen(
@@ -33,6 +37,20 @@ class _HomeScreenState extends State<HomeScreen> {
           userId: widget.userId,
           email: widget.email),
     ];
+    AppEvents.openAnalysisTab.addListener(_goToAnalysis);
+  }
+
+  @override
+  void dispose() {
+    AppEvents.openAnalysisTab.removeListener(_goToAnalysis);
+    super.dispose();
+  }
+
+  // The Home insight card opens the Analysis tab
+  void _goToAnalysis() {
+    if (AppEvents.openAnalysisTab.value != null && mounted) {
+      setState(() => _selectedIndex = 2);
+    }
   }
 
   @override
@@ -83,7 +101,12 @@ class _HomeScreenState extends State<HomeScreen> {
 class _HomeBody extends StatefulWidget {
   final String fullName;
   final int userId;
-  const _HomeBody({required this.fullName, required this.userId});
+  final VoidCallback onOpenProfile;
+  const _HomeBody({
+    required this.fullName,
+    required this.userId,
+    required this.onOpenProfile,
+  });
 
   @override
   State<_HomeBody> createState() => _HomeBodyState();
@@ -98,17 +121,125 @@ class _HomeBodyState extends State<_HomeBody> {
   void initState() {
     super.initState();
     _load();
+    _loadHighlight();
     // Refresh automatically after SMS sync, manual add or category edit
     AppEvents.transactionsChanged.addListener(_refresh);
+    // Update the greeting when the name is changed in Profile
+    AppEvents.fullName.addListener(_onNameChanged);
   }
 
   @override
   void dispose() {
     AppEvents.transactionsChanged.removeListener(_refresh);
+    AppEvents.fullName.removeListener(_onNameChanged);
     super.dispose();
   }
 
-  void _refresh() => _load(silent: true);
+  void _onNameChanged() {
+    if (mounted) setState(() {});
+  }
+
+  String get _name => AppEvents.fullName.value ?? widget.fullName;
+
+  void _refresh() {
+    _load(silent: true);
+    _loadHighlight();
+  }
+
+  // ── Highlight card (one item from the analysis) ───────────────────────────
+  // Loaded separately so Home never waits for the models to run.
+  Map<String, dynamic>? _analysis;
+  bool _analysisLoading = true;
+
+  Future<void> _loadHighlight() async {
+    try {
+      final a = await ApiService.getAnalysis(userId: widget.userId);
+      if (!mounted) return;
+      setState(() {
+        _analysis = a;
+        _analysisLoading = false;
+      });
+    } catch (_) {
+      // e.g. fewer than 5 transactions: just hide the card
+      if (!mounted) return;
+      setState(() {
+        _analysis = null;
+        _analysisLoading = false;
+      });
+    }
+  }
+
+  static const _shortMonths = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                               'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+  String _shortDate(String iso) {
+    final d = DateTime.tryParse(iso);
+    return d == null ? iso : '${d.day} ${_shortMonths[d.month - 1]}';
+  }
+
+  /// Picks the most useful single item: an unusual transaction first,
+  /// then the forecast, then the top insight.
+  Widget _highlightCard() {
+    if (_analysisLoading) {
+      return _HighlightCard(
+        icon: Icons.auto_awesome,
+        color: const Color(0xFF5B2EFF),
+        title: 'Analysing your spending…',
+        subtitle: 'This can take a moment the first time.',
+        loading: true,
+        onTap: null,
+      );
+    }
+    final a = _analysis;
+    if (a == null) return const SizedBox.shrink();
+
+    final anomalies = List<Map<String, dynamic>>.from(
+        (a['anomaly_detection'] ?? {})['anomalies'] ?? []);
+    if (anomalies.isNotEmpty) {
+      final top = anomalies.first;
+      final n = anomalies.length;
+      return _HighlightCard(
+        icon: Icons.warning_amber_rounded,
+        color: const Color(0xFFFF9800),
+        title: n == 1
+            ? '1 transaction looks unusual'
+            : '$n transactions look unusual',
+        subtitle:
+            '${_fmt((top['amount'] as num).toDouble())} on ${top['category']}, ${_shortDate(top['date'] as String)}. Tap to review.',
+        onTap: () => AppEvents.openAnalysis(AnalysisTabs.anomalies),
+      );
+    }
+
+    final prediction = Map<String, dynamic>.from(a['spending_prediction'] ?? {});
+    final preds = List<Map<String, dynamic>>.from(prediction['predictions'] ?? []);
+    if (prediction['status'] == 'ok' && preds.isNotEmpty) {
+      final next = (preds.first['predicted_spend_kes'] as num).toDouble();
+      final avg = (prediction['average_weekly_spend_kes'] as num?)?.toDouble() ?? 0;
+      final diff = avg > 0 ? (next - avg) / avg * 100 : 0.0;
+      final compare = diff > 10
+          ? '${diff.toStringAsFixed(0)}% above your usual ${_fmt(avg)}'
+          : diff < -10
+              ? '${diff.abs().toStringAsFixed(0)}% below your usual ${_fmt(avg)}'
+              : 'In line with your usual ${_fmt(avg)} a week';
+      return _HighlightCard(
+        icon: Icons.trending_up_rounded,
+        color: const Color(0xFF5B2EFF),
+        title: 'Next week: about ${_fmt(next)}',
+        subtitle: '$compare. Tap for the 4-week forecast.',
+        onTap: () => AppEvents.openAnalysis(AnalysisTabs.forecast),
+      );
+    }
+
+    final insights = List<String>.from(a['insights'] ?? []);
+    if (insights.isEmpty) return const SizedBox.shrink();
+    return _HighlightCard(
+      icon: Icons.lightbulb_outline,
+      color: const Color(0xFF00BCD4),
+      title: 'Insight',
+      subtitle: insights.first,
+      onTap: () => AppEvents.openAnalysis(AnalysisTabs.insights),
+    );
+  }
 
   Future<void> _load({bool silent = false}) async {
     if (!mounted) return;
@@ -123,7 +254,13 @@ class _HomeBodyState extends State<_HomeBody> {
     }
   }
 
-  String get _firstName => widget.fullName.split(' ').first;
+  String get _firstName => _name.trim().split(' ').first;
+
+  String get _initials {
+    final parts = _name.trim().split(RegExp(r'\s+')).where((p) => p.isNotEmpty);
+    final letters = parts.take(2).map((p) => p[0]).join().toUpperCase();
+    return letters.isEmpty ? '?' : letters;
+  }
 
   // ── Month being viewed (defaults to the current month) ─────────────────────
   DateTime _month = DateTime(DateTime.now().year, DateTime.now().month);
@@ -387,59 +524,45 @@ class _HomeBodyState extends State<_HomeBody> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // ── Top bar ────────────────────────────────────────────────
+              // ── Greeting and avatar (tap the avatar to open Profile) ─────
               Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  const Icon(Icons.menu, color: Color(0xFF1A1A2E), size: 24),
-                  Row(
-                    children: [
-                      Container(
-                        width: 36, height: 36,
-                        decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.07),
-                          borderRadius: BorderRadius.circular(18),
-                        ),
-                        child: const Icon(Icons.notifications_outlined,
-                            color: Color(0xFF1A1A2E), size: 20),
-                      ),
-                      const SizedBox(width: 10),
-                      Container(
-                        width: 36, height: 36,
-                        decoration: const BoxDecoration(
-                          color: Color(0xFF5B2EFF),
-                          shape: BoxShape.circle,
-                        ),
-                        child: Center(
-                          child: Text(
-                            widget.fullName.isNotEmpty
-                                ? widget.fullName
-                                    .split(' ')
-                                    .take(2)
-                                    .map((w) => w[0])
-                                    .join()
-                                : '?',
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Hi, $_firstName 👋',
                             style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 12,
-                                fontWeight: FontWeight.bold),
-                          ),
+                                color: Color(0xFF1A1A2E),
+                                fontSize: 22,
+                                fontWeight: FontWeight.bold)),
+                        const Text('Here is your spending pulse today',
+                            style: TextStyle(color: Colors.black54, fontSize: 13)),
+                      ],
+                    ),
+                  ),
+                  GestureDetector(
+                    onTap: widget.onOpenProfile,
+                    child: Container(
+                      width: 40,
+                      height: 40,
+                      decoration: const BoxDecoration(
+                        color: Color(0xFF5B2EFF),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Center(
+                        child: Text(
+                          _initials,
+                          style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                              fontWeight: FontWeight.bold),
                         ),
                       ),
-                    ],
+                    ),
                   ),
                 ],
               ),
-              const SizedBox(height: 14),
-
-              // ── Greeting ───────────────────────────────────────────────
-              Text('Hi, $_firstName 👋',
-                  style: const TextStyle(
-                      color: Color(0xFF1A1A2E),
-                      fontSize: 22,
-                      fontWeight: FontWeight.bold)),
-              const Text('Here is your spending pulse today',
-                  style: TextStyle(color: Colors.black54, fontSize: 13)),
               const SizedBox(height: 20),
 
               // ── Spending card ──────────────────────────────────────────
@@ -551,9 +674,12 @@ class _HomeBodyState extends State<_HomeBody> {
                   ],
                 ),
               ),
-              const SizedBox(height: 20),
+              const SizedBox(height: 16),
 
-              const SizedBox(height: 28),
+              // ── Highlight from the analysis ────────────────────────────
+              _highlightCard(),
+
+              const SizedBox(height: 24),
 
               // ── Weekly chart ───────────────────────────────────────────
               const Text('This Week',
@@ -845,6 +971,82 @@ class _CategoryTile extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// The single highlight shown on Home (unusual transaction, forecast or insight).
+class _HighlightCard extends StatelessWidget {
+  final IconData icon;
+  final Color color;
+  final String title;
+  final String subtitle;
+  final bool loading;
+  final VoidCallback? onTap;
+  const _HighlightCard({
+    required this.icon,
+    required this.color,
+    required this.title,
+    required this.subtitle,
+    this.loading = false,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(16),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: color.withOpacity(0.35)),
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: color.withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: loading
+                    ? Padding(
+                        padding: const EdgeInsets.all(11),
+                        child: CircularProgressIndicator(strokeWidth: 2, color: color),
+                      )
+                    : Icon(icon, color: color, size: 22),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title,
+                        style: const TextStyle(
+                            color: Color(0xFF1A1A2E),
+                            fontWeight: FontWeight.w600,
+                            fontSize: 14)),
+                    const SizedBox(height: 3),
+                    Text(subtitle,
+                        maxLines: 3,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                            color: Colors.black54, fontSize: 12, height: 1.4)),
+                  ],
+                ),
+              ),
+              if (onTap != null)
+                const Icon(Icons.chevron_right, color: Colors.black26),
+            ],
+          ),
+        ),
       ),
     );
   }
