@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'api_service.dart';
 import 'app_events.dart';
+import 'edit_profile_screen.dart';
 import 'login_screen.dart';
 import 'sms_sync_service.dart';
 
@@ -22,9 +23,16 @@ class _ProfileScreenState extends State<ProfileScreen> {
   bool _smsAllowed = false;
   bool _syncing = false;
 
+  // Profile details (refreshed from the server; start with what login gave us)
+  late String _name = widget.fullName;
+  late String _email = widget.email ?? '';
+  String _phone = '';
+  String? _memberSince;
+
   @override
   void initState() {
     super.initState();
+    _loadProfile();
     _load();
     AppEvents.transactionsChanged.addListener(_load);
   }
@@ -51,26 +59,59 @@ class _ProfileScreenState extends State<ProfileScreen> {
     }
   }
 
+  Future<void> _loadProfile() async {
+    try {
+      final p = await ApiService.getProfile();
+      if (!mounted) return;
+      setState(() => _applyProfile(p));
+    } catch (_) {
+      // Keep the details we already have
+    }
+  }
+
+  void _applyProfile(Map<String, dynamic> p) {
+    _name = (p['full_name'] as String?) ?? _name;
+    _email = (p['email'] as String?) ?? _email;
+    _phone = (p['phone'] as String?) ?? '';
+    _memberSince = p['member_since'] as String?;
+    AppEvents.fullName.value = _name;
+  }
+
+  Future<void> _editProfile() async {
+    final updated = await Navigator.push<Map<String, dynamic>>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => EditProfileScreen(fullName: _name, email: _email, phone: _phone),
+      ),
+    );
+    if (updated == null || !mounted) return;
+    setState(() => _applyProfile(updated));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Profile updated')),
+    );
+  }
+
+  void _changePassword() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const ChangePasswordScreen()),
+    );
+  }
+
+  String get _memberSinceLabel {
+    final d = DateTime.tryParse(_memberSince ?? '');
+    if (d == null) return '';
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return 'Member since ${months[d.month - 1]} ${d.year}';
+  }
+
   // ── Stats ──────────────────────────────────────────────────────────────────
-  double get _totalSpent =>
-      _transactions.fold(0.0, (s, t) => s + (t['amount'] as num).toDouble());
-
-  int get _monthsTracked => _transactions
-      .map((t) => (t['date'] as String).substring(0, 7))
-      .toSet()
-      .length;
-
   int get _fromSms =>
       _transactions.where((t) => t['is_manual'] == false).length;
 
-  String _fmt(double v) {
-    if (v >= 1000000) return 'KSh ${(v / 1000000).toStringAsFixed(1)}M';
-    if (v >= 1000) return 'KSh ${(v / 1000).toStringAsFixed(1)}k';
-    return 'KSh ${v.toStringAsFixed(0)}';
-  }
-
   String get _initials {
-    final parts = widget.fullName.trim().split(RegExp(r'\s+'));
+    final parts = _name.trim().split(RegExp(r'\s+'));
     return parts.where((p) => p.isNotEmpty).take(2).map((p) => p[0]).join().toUpperCase();
   }
 
@@ -79,7 +120,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     setState(() => _syncing = true);
     final r = await SmsSyncService.sync(
       userId: widget.userId,
-      ownName: widget.fullName,
+      ownName: _name,
       sinceDays: 365,
     );
     if (!mounted) return;
@@ -164,44 +205,41 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(widget.fullName,
+                        Text(_name,
                             style: const TextStyle(
                                 color: Color(0xFF1A1A2E),
                                 fontSize: 17,
                                 fontWeight: FontWeight.bold)),
-                        if (widget.email != null &&
-                            widget.email!.isNotEmpty) ...[
+                        if (_email.isNotEmpty) ...[
                           const SizedBox(height: 2),
-                          Text(widget.email!,
+                          Text(_email,
                               style: const TextStyle(
                                   color: Colors.black54, fontSize: 13)),
                         ],
+                        if (_phone.isNotEmpty) ...[
+                          const SizedBox(height: 2),
+                          Text(_phone,
+                              style: const TextStyle(
+                                  color: Colors.black54, fontSize: 13)),
+                        ],
+                        if (_memberSinceLabel.isNotEmpty) ...[
+                          const SizedBox(height: 4),
+                          Text(_memberSinceLabel,
+                              style: const TextStyle(
+                                  color: Colors.black38, fontSize: 11)),
+                        ],
                       ],
                     ),
+                  ),
+                  IconButton(
+                    tooltip: 'Edit profile',
+                    onPressed: _editProfile,
+                    icon: const Icon(Icons.edit_outlined, color: Color(0xFF5B2EFF)),
                   ),
                 ],
               ),
             ),
             const SizedBox(height: 14),
-
-            // Stats
-            if (_loading)
-              const Padding(
-                padding: EdgeInsets.all(24),
-                child: Center(
-                    child: CircularProgressIndicator(color: Color(0xFF5B2EFF))),
-              )
-            else
-              Row(
-                children: [
-                  _Stat(label: 'Transactions', value: '${_transactions.length}'),
-                  const SizedBox(width: 10),
-                  _Stat(label: 'Months tracked', value: '$_monthsTracked'),
-                  const SizedBox(width: 10),
-                  _Stat(label: 'Total recorded', value: _fmt(_totalSpent)),
-                ],
-              ),
-            const SizedBox(height: 20),
 
             // SMS import
             const _SectionTitle('SMS import'),
@@ -262,26 +300,48 @@ class _ProfileScreenState extends State<ProfileScreen> {
             ),
             const SizedBox(height: 20),
 
-            // Privacy
-            const _SectionTitle('Your data'),
-            const _Card(
+            // Account
+            const _SectionTitle('Account'),
+            _Card(
               child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  _Bullet('Transaction messages are processed on your phone. Only the amount, date, merchant and payment method are saved, never the full message text.'),
-                  _Bullet('Only messages from M-Pesa, Airtel Money and I&M Bank are read. Personal messages are skipped without being opened.'),
-                  _Bullet('Your password is stored encrypted (hashed).'),
+                  _ActionRow(
+                    icon: Icons.person_outline,
+                    label: 'Edit profile',
+                    subtitle: 'Name, email and phone number',
+                    onTap: _editProfile,
+                  ),
+                  const Divider(height: 1, color: Colors.black12),
+                  _ActionRow(
+                    icon: Icons.lock_outline,
+                    label: 'Change password',
+                    subtitle: 'Requires your current password',
+                    onTap: _changePassword,
+                  ),
                 ],
               ),
             ),
             const SizedBox(height: 20),
 
-            // About
-            const _SectionTitle('About'),
-            const _Card(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
+            // Privacy (tap to expand)
+            const _CollapsibleCard(
+              icon: Icons.shield_outlined,
+              title: 'Your data and privacy',
+              children: [
+                  _Bullet('Transaction messages are processed on your phone. Only the amount, date, merchant and payment method are saved, never the full message text.'),
+                  _Bullet('Only messages from M-Pesa, Airtel Money and I&M Bank are read. Personal messages are skipped without being opened.'),
+                  _Bullet('Your password is stored encrypted (hashed), and every request to the server needs your login token.'),
+              ],
+            ),
+            const SizedBox(height: 20),
+
+            const SizedBox(height: 12),
+
+            // About (tap to expand)
+            const _CollapsibleCard(
+              icon: Icons.info_outline,
+              title: 'About Pesight',
+              children: [
                   Text('Pesight  •  version 1.0.0',
                       style: TextStyle(
                           color: Color(0xFF1A1A2E),
@@ -292,8 +352,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     'Spending habits, unusual-transaction alerts and weekly forecasts are produced by machine learning models (K-Means, Isolation Forest and Random Forest). Forecasts are estimates, not guarantees.',
                     style: TextStyle(color: Colors.black54, fontSize: 12, height: 1.5),
                   ),
-                ],
-              ),
+              ],
             ),
             const SizedBox(height: 24),
 
@@ -343,33 +402,6 @@ class _Card extends StatelessWidget {
   }
 }
 
-class _Stat extends StatelessWidget {
-  final String label;
-  final String value;
-  const _Stat({required this.label, required this.value});
-
-  @override
-  Widget build(BuildContext context) {
-    return Expanded(
-      child: _Card(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(value,
-                style: const TextStyle(
-                    color: Color(0xFF5B2EFF),
-                    fontWeight: FontWeight.bold,
-                    fontSize: 15)),
-            const SizedBox(height: 4),
-            Text(label,
-                style: const TextStyle(color: Colors.black45, fontSize: 11)),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 class _SectionTitle extends StatelessWidget {
   final String text;
   const _SectionTitle(this.text);
@@ -408,6 +440,99 @@ class _Bullet extends StatelessWidget {
                     color: Colors.black87, fontSize: 13, height: 1.4)),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _ActionRow extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String subtitle;
+  final VoidCallback onTap;
+  const _ActionRow({
+    required this.icon,
+    required this.label,
+    required this.subtitle,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        child: Row(
+          children: [
+            Icon(icon, color: const Color(0xFF5B2EFF), size: 22),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(label,
+                      style: const TextStyle(
+                          color: Color(0xFF1A1A2E),
+                          fontWeight: FontWeight.w600,
+                          fontSize: 14)),
+                  const SizedBox(height: 2),
+                  Text(subtitle,
+                      style: const TextStyle(color: Colors.black45, fontSize: 12)),
+                ],
+              ),
+            ),
+            const Icon(Icons.chevron_right, color: Colors.black26),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A card that shows only its title until tapped.
+class _CollapsibleCard extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final List<Widget> children;
+  const _CollapsibleCard({
+    required this.icon,
+    required this.title,
+    required this.children,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+              color: Colors.black.withOpacity(0.04),
+              blurRadius: 8,
+              offset: const Offset(0, 2))
+        ],
+      ),
+      child: Theme(
+        // Removes the divider lines ExpansionTile draws when open
+        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          leading: Icon(icon, color: const Color(0xFF5B2EFF)),
+          title: Text(title,
+              style: const TextStyle(
+                  color: Color(0xFF1A1A2E),
+                  fontWeight: FontWeight.w600,
+                  fontSize: 14)),
+          iconColor: const Color(0xFF5B2EFF),
+          collapsedIconColor: Colors.black38,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          collapsedShape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+          expandedCrossAxisAlignment: CrossAxisAlignment.start,
+          children: children,
+        ),
       ),
     );
   }

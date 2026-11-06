@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -57,6 +57,12 @@ FALLBACK_CATEGORY = "Groceries"
 # borderline, so only clearer cases are shown.
 ANOMALY_WARMUP_DAYS = 14
 ANOMALY_SCORE_CUTOFF = -0.03
+# Anomalies are alerts, so only recent ones are shown, recurring payments
+# (e.g. monthly rent) are skipped, and only the most unusual few are listed.
+ANOMALY_RECENT_DAYS = 30
+ANOMALY_MAX_SHOWN = 5
+RECURRING_GAP_DAYS = (25, 35)      # about a month apart
+RECURRING_AMOUNT_TOLERANCE = 0.10  # within 10% of each other
 
 SOURCE_MAP = {
     "CARD": 0,
@@ -95,6 +101,7 @@ def fetch_user_transactions(user_id: int, db: Session) -> pd.DataFrame:
                 t.date,
                 t.transaction_type,
                 t.source,
+                t.counterparty,
                 c.name AS category_name,
                 COALESCE(t.anomaly_dismissed, FALSE) AS anomaly_dismissed
             FROM transactions t
@@ -117,6 +124,7 @@ def fetch_user_transactions(user_id: int, db: Session) -> pd.DataFrame:
             "date",
             "transaction_type",
             "source",
+            "counterparty",
             "category_name",
             "anomaly_dismissed",
         ],
@@ -126,6 +134,7 @@ def fetch_user_transactions(user_id: int, db: Session) -> pd.DataFrame:
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
     df["category_name"] = df["category_name"].fillna("Other")
     df["source"] = df["source"].fillna("MPESA")
+    df["counterparty"] = df["counterparty"].fillna("").astype(str).str.strip().str.upper()
     df["transaction_type"] = df["transaction_type"].fillna("expense")
 
     df = df.dropna(subset=["date", "amount"])
@@ -238,8 +247,15 @@ def build_weekly_features(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── K-Means spending pattern analysis ───────────────────────────────────────
 
-def run_clustering(df: pd.DataFrame) -> dict:
-    """Assign transactions to the trained K-Means spending clusters."""
+HABIT_PERIODS = [30, 90, 180, 365]  # the periods the Habits tab can switch between
+
+
+def run_clustering(df: pd.DataFrame, period_start=None) -> dict:
+    """
+    Assign transactions to the trained K-Means spending clusters.
+    Features are built from the whole history (so comparisons with earlier
+    spending are correct), but only the selected period is described.
+    """
     kmeans = models["kmeans_model"]
     scaler = models["scaler_clustering"]
 
@@ -261,47 +277,148 @@ def run_clustering(df: pd.DataFrame) -> dict:
     x = featured_df[clustering_features].values
     x_scaled = scaler.transform(x)
     featured_df["cluster"] = kmeans.predict(x_scaled)
+    end = featured_df["date"].max()
 
-    cluster_summary = (
-        featured_df.groupby("cluster")
-        .agg(
-            transaction_count=("amount", "count"),
-            avg_amount=("amount", "mean"),
-            total_spend=("amount", "sum"),
-            pct_weekend=("is_weekend", "mean"),
-        )
-        .round(2)
-        .reset_index()
-    )
-
-    top_categories = (
-        featured_df.groupby(["cluster", "category_name"])["amount"]
-        .sum()
-        .reset_index()
-        .sort_values("amount", ascending=False)
-        .groupby("cluster")
-        .first()["category_name"]
-        .to_dict()
-    )
-
-    clusters_out = {}
-    for _, row in cluster_summary.iterrows():
-        cluster_id = int(row["cluster"])
-        clusters_out[cluster_id] = {
-            "transaction_count": int(row["transaction_count"]),
-            "avg_amount_kes": round(float(row["avg_amount"]), 2),
-            "total_spend_kes": round(float(row["total_spend"]), 2),
-            "pct_weekend": round(float(row["pct_weekend"]) * 100, 1),
-            "top_category": top_categories.get(cluster_id, "Unknown"),
+    # Habits for each period the app can show, so switching is instant
+    by_period = {}
+    for days in HABIT_PERIODS:
+        window = featured_df[featured_df["date"] >= end - pd.Timedelta(days=days - 1)]
+        by_period[str(days)] = {
+            "days": days,
+            "transaction_count": int(len(window)),
+            "total_spend_kes": round(float(window["amount"].sum()), 2),
+            "clusters": describe_clusters(window) if len(window) else {},
         }
 
+    if period_start is not None:
+        featured_df = featured_df[featured_df["date"] >= period_start]
+    if featured_df.empty:
+        return {"cluster_count": 0, "model_cluster_count": int(kmeans.n_clusters),
+                "clusters": {}, "by_period": by_period}
+
     return {
-        "cluster_count": int(kmeans.n_clusters),
-        "clusters": clusters_out,
+        "cluster_count": int(featured_df["cluster"].nunique()),  # habits this user actually has
+        "model_cluster_count": int(kmeans.n_clusters),
+        "clusters": describe_clusters(featured_df),
+        "by_period": by_period,
     }
 
 
+DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+SOURCE_LABELS = {"MPESA": "M-Pesa", "CARD": "card", "CASH": "cash", "WALLET": "wallet"}
+
+
+def _habit_name(median_amount: float, user_median: float, pct_weekend: float,
+                count_share: float, top_categories: list, bills_count_pct: float,
+                pct_new_category: float) -> str:
+    """A plain-language name built from what is in the group."""
+    main_cat, main_share = (top_categories[0]["name"], top_categories[0]["pct"]) if top_categories else ("", 0)
+
+    if median_amount >= 5 * user_median and count_share <= 0.10:
+        return "Big one-off purchases"
+    # Mostly first-ever payments in a category (common in the first days of data)
+    if pct_new_category >= 50:
+        return "First-time spending"
+    # Bills must be most of the money AND most of the payments
+    # (one large rent payment alone should not make a group "bills")
+    if main_cat == "Bills & Utilities" and main_share >= 50 and bills_count_pct >= 50:
+        return "Bills and utilities"
+
+    if median_amount <= user_median:
+        size = "Small"
+    elif median_amount >= 3 * user_median:
+        size = "Large"
+    else:
+        size = ""
+
+    if pct_weekend >= 70:
+        when = "weekend"
+    elif pct_weekend <= 15:
+        when = "weekday"
+    else:
+        when = ""
+
+    if size and when:
+        return f"{size} {when} {'spends' if size == 'Small' else 'payments'}"
+    if when:
+        return f"{when.capitalize()} spending"
+    if size:
+        return f"{size} {'everyday spends' if size == 'Small' else 'payments'}"
+    return "Everyday spending"
+
+
+def describe_clusters(featured_df: pd.DataFrame) -> dict:
+    """
+    Describe each habit (cluster) in terms a user understands: what it is
+    mostly spent on, where, how much, when and how it is paid.
+    """
+    total_money = float(featured_df["amount"].sum()) or 1.0
+    total_count = len(featured_df) or 1
+    user_median = float(featured_df["amount"].median()) or 1.0
+
+    clusters_out = {}
+    for cluster_id, g in featured_df.groupby("cluster"):
+        money = float(g["amount"].sum())
+
+        cat_money = g.groupby("category_name")["amount"].sum().sort_values(ascending=False)
+        top_categories = [
+            {"name": str(name), "pct": round(float(amount) / money * 100) if money else 0}
+            for name, amount in cat_money.head(3).items()
+        ]
+
+        merchants = g.loc[g["counterparty"] != "", "counterparty"].value_counts().head(3)
+        top_merchants = [str(m).title() for m in merchants.index]
+
+        median_amount = float(g["amount"].median())
+        pct_weekend = float(g["is_weekend"].mean() * 100)
+        count_share = len(g) / total_count
+
+        bills_count_pct = float((g["category_name"] == "Bills & Utilities").mean() * 100)
+
+        clusters_out[int(cluster_id)] = {
+            "habit_name": _habit_name(median_amount, user_median, pct_weekend, count_share,
+                                      top_categories, bills_count_pct,
+                                      float(g["is_new_category"].mean() * 100)),
+            "transaction_count": int(len(g)),
+            "avg_amount_kes": round(float(g["amount"].mean()), 2),
+            "median_amount_kes": round(median_amount, 2),
+            "typical_low_kes": round(float(g["amount"].quantile(0.25)), 2),
+            "typical_high_kes": round(float(g["amount"].quantile(0.75)), 2),
+            "total_spend_kes": round(money, 2),
+            "share_of_spend_pct": round(money / total_money * 100, 1),
+            "pct_weekend": round(pct_weekend, 1),
+            "busiest_day": DAY_NAMES[int(g["day_of_week"].mode().iloc[0])],
+            "main_source": SOURCE_LABELS.get(str(g["source"].mode().iloc[0]).upper(), "M-Pesa"),
+            "top_category": top_categories[0]["name"] if top_categories else "Other",
+            "top_categories": top_categories,
+            "top_merchants": top_merchants,
+        }
+
+    # Make names unique, e.g. two "Weekday spending" groups
+    seen = {}
+    for c in sorted(clusters_out.values(), key=lambda c: -c["total_spend_kes"]):
+        name = c["habit_name"]
+        if name in seen:
+            c["habit_name"] = f"{name} ({c['top_category']})"
+        seen[name] = True
+
+    return clusters_out
+
+
 # ── Isolation Forest anomaly detection ──────────────────────────────────────
+
+def _is_recurring(row, df: pd.DataFrame) -> bool:
+    """True if the same payee received a similar amount about a month before or after."""
+    payee = row["counterparty"]
+    if not payee:
+        return False
+    same_payee = df[(df["counterparty"] == payee) & (df["transaction_id"] != row["transaction_id"])]
+    if same_payee.empty:
+        return False
+    gap = (same_payee["date"] - row["date"]).abs().dt.days
+    similar = (same_payee["amount"] - row["amount"]).abs() <= RECURRING_AMOUNT_TOLERANCE * row["amount"]
+    return bool(((gap >= RECURRING_GAP_DAYS[0]) & (gap <= RECURRING_GAP_DAYS[1]) & similar).any())
+
 
 def run_anomaly_detection(df: pd.DataFrame) -> dict:
     """Flag transactions that the trained Isolation Forest considers unusual."""
@@ -339,9 +456,22 @@ def run_anomaly_detection(df: pd.DataFrame) -> dict:
     after_warmup = featured_df["date"] >= warmup_end
     clear_case = featured_df["anomaly_score"] < ANOMALY_SCORE_CUTOFF
 
-    anomalies = featured_df[
+    candidates = featured_df[
         (featured_df["anomaly_flag"] == -1) & clear_case & after_warmup & ~dismissed
     ].copy()
+    model_flagged = len(candidates)
+
+    # Only recent transactions are worth an alert
+    recent_start = featured_df["date"].max() - pd.Timedelta(days=ANOMALY_RECENT_DAYS)
+    candidates = candidates[candidates["date"] >= recent_start]
+
+    # Skip recurring payments (same payee, similar amount, about a month apart)
+    candidates = candidates[
+        ~candidates.apply(lambda row: _is_recurring(row, featured_df), axis=1)
+    ] if len(candidates) else candidates
+
+    # Show only the most unusual few
+    anomalies = candidates.sort_values("anomaly_score").head(ANOMALY_MAX_SHOWN)
     anomaly_rate = (len(anomalies) / len(featured_df) * 100) if len(featured_df) else 0
 
     anomaly_list = sorted(
@@ -361,6 +491,8 @@ def run_anomaly_detection(df: pd.DataFrame) -> dict:
 
     return {
         "total_transactions": int(len(featured_df)),
+        "model_flagged_count": int(model_flagged),  # before the display rules
+        "recent_days": ANOMALY_RECENT_DAYS,
         "anomaly_count": int(len(anomalies)),
         "anomaly_rate_pct": round(float(anomaly_rate), 2),
         "anomalies": anomaly_list,
@@ -458,187 +590,234 @@ def run_prediction(df: pd.DataFrame) -> dict:
 
 # ── Insights and recommendations ────────────────────────────────────────────
 
-def generate_insights_and_recommendations(
-    df: pd.DataFrame,
+# ── Recurring payments and subscriptions ─────────────────────────────────────
+
+RECURRING_PATTERNS = [
+    # (label, min days between payments, max days, minimum number of payments)
+    ("Weekly", 6, 8, 3),
+    ("Every 2 weeks", 13, 16, 3),
+    ("Monthly", 26, 35, 2),
+]
+RECURRING_PRICE_TOLERANCE = 0.15   # payments within 15% of the usual amount
+PRICE_CHANGE_THRESHOLD = 0.10      # a change of more than 10% is reported
+
+
+def detect_recurring(df: pd.DataFrame) -> dict:
+    """
+    Find payments that repeat on a regular schedule to the same payee
+    (subscriptions, rent, fibre, airtime bundles...). Rule-based: the same
+    payee, a similar amount, and a regular gap between payments.
+    """
+    end = df["date"].max()
+    found = []
+
+    for payee, g in df[df["counterparty"] != ""].groupby("counterparty"):
+        g = g.sort_values("date")
+        if len(g) < 2:
+            continue
+        gaps = g["date"].diff().dt.days.dropna()
+        median_gap = float(gaps.median())
+
+        pattern = next(
+            (p for p in RECURRING_PATTERNS if p[1] <= median_gap <= p[2] and len(g) >= p[3]),
+            None,
+        )
+        if pattern is None:
+            continue
+        label, low, high, _ = pattern
+
+        # Most gaps must fit the pattern, and most amounts must be similar
+        if ((gaps >= low) & (gaps <= high)).mean() < 0.7:
+            continue
+        usual = float(g["amount"].median())
+        similar = ((g["amount"] - usual).abs() <= RECURRING_PRICE_TOLERANCE * usual).mean()
+        if similar < 0.7:
+            continue
+
+        last = g.iloc[-1]
+        previous_amount = float(g.iloc[-2]["amount"])
+        last_amount = float(last["amount"])
+        next_due = last["date"] + pd.Timedelta(days=round(median_gap))
+        per_month = usual * (30.4 / median_gap)
+
+        price_change = None
+        if previous_amount > 0 and abs(last_amount - previous_amount) / previous_amount > PRICE_CHANGE_THRESHOLD:
+            price_change = {"from": round(previous_amount, 2), "to": round(last_amount, 2)}
+
+        if end > last["date"] + pd.Timedelta(days=round(median_gap * 1.5)):
+            status_ = "may_have_stopped"
+        elif next_due <= end + pd.Timedelta(days=7):
+            status_ = "due_soon"
+        else:
+            status_ = "active"
+
+        found.append({
+            "name": str(payee).title(),
+            "category": str(g["category_name"].mode().iloc[0]),
+            "frequency": label,
+            "usual_amount_kes": round(usual, 2),
+            "last_amount_kes": round(last_amount, 2),
+            "last_date": str(last["date"].date()),
+            "next_expected_date": str(next_due.date()),
+            "payments": int(len(g)),
+            "monthly_cost_kes": round(per_month, 2),
+            "yearly_cost_kes": round(per_month * 12, 2),
+            "status": status_,
+            "is_new": bool(len(g) == 2 and g.iloc[0]["date"] >= end - pd.Timedelta(days=70)),
+            "price_change": price_change,
+        })
+
+    found.sort(key=lambda r: -r["monthly_cost_kes"])
+    active = [r for r in found if r["status"] != "may_have_stopped"]
+    monthly_total = sum(r["monthly_cost_kes"] for r in active)
+    return {
+        "count": len(found),
+        "active_count": len(active),
+        "monthly_total_kes": round(monthly_total, 2),
+        "yearly_total_kes": round(monthly_total * 12, 2),
+        "payments": found,
+    }
+
+
+# ── Insight cards (most important first) ─────────────────────────────────────
+
+def _ksh(v: float) -> str:
+    return f"KSh {v:,.0f}"
+
+
+def build_insight_cards(
+    period_df: pd.DataFrame,
+    period_days: int,
     clustering: dict,
     anomaly_result: dict,
     prediction_result: dict,
-) -> dict:
-    insights = []
-    recommendations = []
+    recurring: dict,
+) -> list:
+    """
+    Each card pairs what we noticed with what the user can do about it.
+    'priority' orders them (higher = more important); 'tab' says which
+    Analysis tab has the details.
+    """
+    cards = []
 
-    if df.empty:
-        return {
-            "insights": ["No transaction data found."],
-            "recommendations": ["Add or import transactions to start seeing spending insights."],
-        }
+    def card(priority, kind, title, detail, action=None, tab=None):
+        cards.append({"priority": priority, "type": kind, "title": title,
+                      "detail": detail, "action": action, "tab": tab})
 
-    # ── Category breakdown ─────────────────────────────────────────────────
-    category_summary = (
-        df.groupby("category_name")
-        .agg(total_spent=("amount", "sum"), transaction_count=("amount", "count"))
-        .sort_values("total_spent", ascending=False)
-    )
+    # Unusual transactions: needs checking
+    n = int(anomaly_result.get("anomaly_count", 0))
+    days = anomaly_result.get("recent_days", 30)
+    if n:
+        top = anomaly_result["anomalies"][0]
+        card(100, "alert",
+             f"{n} unusual transaction{'s' if n > 1 else ''} to check",
+             f"The most unusual is {_ksh(top['amount'])} on {top['category']} on {top['date']}, "
+             f"compared with your own spending over the last {days} days.",
+             "Confirm these were you. Mark any that are normal so they are not flagged again.",
+             "anomalies")
 
-    total_spending = float(df["amount"].sum())
+    # Subscriptions: new ones and price rises first
+    for r in recurring.get("payments", []):
+        if r["price_change"] and r["price_change"]["to"] > r["price_change"]["from"]:
+            card(88, "subscription",
+                 f"{r['name']} now costs more",
+                 f"It went from {_ksh(r['price_change']['from'])} to {_ksh(r['price_change']['to'])}.",
+                 "Check whether the new price is still worth it.", "recurring")
+        elif r["is_new"] and r["status"] != "may_have_stopped":
+            card(80, "subscription",
+                 f"New regular payment: {r['name']}",
+                 f"{_ksh(r['usual_amount_kes'])} {r['frequency'].lower()} since {r['last_date'][:7]}.",
+                 "Make sure you meant to sign up for it.", "recurring")
+    if recurring.get("active_count"):
+        card(70, "subscription",
+             f"{_ksh(recurring['monthly_total_kes'])} a month goes to regular payments",
+             f"{recurring['active_count']} regular payment{'s' if recurring['active_count'] > 1 else ''} "
+             f"add up to {_ksh(recurring['yearly_total_kes'])} a year.",
+             "Cancel any subscriptions you no longer use.", "recurring")
 
-    if not category_summary.empty and total_spending > 0:
-        top_category = str(category_summary.index[0])
-        top_amount = float(category_summary.iloc[0]["total_spent"])
-        top_pct = top_amount / total_spending * 100
-
-        insights.append(
-            f"You spend the most on {top_category} — "
-            f"KSh {top_amount:,.0f}, which is {top_pct:.0f}% of your total recorded spending."
-        )
-        recommendations.append(
-            f"{top_category} takes up the largest share of your budget. "
-            f"Look through those transactions to see if there are any you could reduce."
-        )
-
-        frequent_category = str(category_summary["transaction_count"].idxmax())
-        frequent_count = int(category_summary.loc[frequent_category, "transaction_count"])
-
-        if frequent_category != top_category:
-            insights.append(
-                f"You make the most individual purchases in {frequent_category} "
-                f"({frequent_count} transactions), even though it is not your biggest spend."
-            )
-            recommendations.append(
-                f"Small {frequent_category} purchases add up quickly. "
-                f"Try tracking your weekly {frequent_category} total to stay aware of it."
-            )
-
-    # ── Date range and weekend behaviour ──────────────────────────────────
-    insights.append(
-        f"This analysis covers {len(df):,} transactions "
-        f"from {df['date'].min().date()} to {df['date'].max().date()}."
-    )
-
-    weekend_pct = float(df["date"].dt.dayofweek.ge(5).mean() * 100)
-    if weekend_pct >= 40:
-        insights.append(
-            f"{weekend_pct:.0f}% of your spending happens on weekends. "
-            f"Weekends tend to be when discretionary spending is highest."
-        )
-        recommendations.append(
-            "Try setting a weekend spending limit. "
-            "It is often easier to cut back on non-essential purchases on weekends than on weekdays."
-        )
+    # Forecast
+    if prediction_result.get("status") == "ok" and prediction_result.get("predictions"):
+        nxt = float(prediction_result["predictions"][0]["predicted_spend_kes"])
+        avg = float(prediction_result["average_weekly_spend_kes"])
+        change = (nxt - avg) / avg * 100 if avg > 0 else 0
+        if change > 10:
+            card(90, "forecast", f"Next week may cost more: about {_ksh(nxt)}",
+                 f"That is {change:.0f}% above your usual {_ksh(avg)} a week.",
+                 "Check for large planned expenses and where you could cut back.", "forecast")
+        elif change < -10:
+            card(45, "forecast", f"Next week looks lighter: about {_ksh(nxt)}",
+                 f"That is {abs(change):.0f}% below your usual {_ksh(avg)} a week.",
+                 None, "forecast")
+        else:
+            card(40, "forecast", f"Next week: about {_ksh(nxt)}",
+                 f"In line with your usual {_ksh(avg)} a week.", None, "forecast")
     else:
-        insights.append(
-            f"Most of your spending ({100 - weekend_pct:.0f}%) happens on weekdays, "
-            f"which is typical for bills, transport, and work-related costs."
-        )
+        card(20, "info", "Forecast not available yet",
+             "At least 4 weeks of transactions are needed to predict your spending.",
+             "Keep recording transactions; the forecast appears automatically.", "forecast")
 
-    # ── Spending patterns (clusters) ───────────────────────────────────────
+    # Categories in the selected period
+    total = float(period_df["amount"].sum())
+    if total > 0:
+        by_cat = (period_df.groupby("category_name")
+                  .agg(total=("amount", "sum"), count=("amount", "count"))
+                  .sort_values("total", ascending=False))
+        top_cat = str(by_cat.index[0])
+        top_share = float(by_cat.iloc[0]["total"]) / total * 100
+        card(60, "category", f"{top_cat} is your biggest expense",
+             f"{_ksh(by_cat.iloc[0]['total'])}, {top_share:.0f}% of your spending in this period.",
+             f"Look through your {top_cat} payments for any you could reduce.", "habits")
+
+        frequent = str(by_cat["count"].idxmax())
+        if frequent != top_cat:
+            card(55, "category", f"Many small {frequent} payments",
+                 f"{int(by_cat.loc[frequent, 'count'])} payments in this period, more than any other category.",
+                 f"Small payments add up. Try tracking your weekly {frequent} total.", "habits")
+
+        weekend_share = float(period_df.loc[period_df["date"].dt.dayofweek >= 5, "amount"].sum()) / total * 100
+        if weekend_share >= 40:
+            card(50, "habit", f"{weekend_share:.0f}% of your spending is on weekends",
+                 "Weekends are when spending on non-essentials is usually highest.",
+                 "Try setting a weekend spending limit.", "habits")
+
+    # Habits
     clusters = clustering.get("clusters", {})
-    cluster_count = clustering.get("cluster_count", 0)
-
     if clusters:
-        largest = max(clusters.values(), key=lambda c: c["transaction_count"])
-        top_cat = largest["top_category"]
-        avg = largest["avg_amount_kes"]
-        pct_wknd = largest["pct_weekend"]
+        frequent_habit = max(clusters.values(), key=lambda c: c["transaction_count"])
+        card(35, "habit", f"Most frequent habit: {frequent_habit['habit_name'].lower()}",
+             f"{frequent_habit['transaction_count']} payments, usually around "
+             f"{_ksh(frequent_habit['median_amount_kes'])}, mostly {frequent_habit['top_category']}.",
+             None, "habits")
 
-        insights.append(
-            f"Your most common spending pattern is centred around {top_cat}, "
-            f"with an average transaction of KSh {avg:,.0f}."
-        )
+    if not n:
+        card(30, "info", f"No unusual transactions in the last {days} days",
+             "Your recent spending looks consistent with your normal habits.", None, "anomalies")
 
-        if cluster_count > 1:
-            recommendations.append(
-                f"Your spending falls into {cluster_count} distinct patterns. "
-                f"The largest is dominated by {top_cat}. "
-                f"Reviewing each pattern can help you spot where your money actually goes."
-            )
+    card(10, "info", "What this covers",
+         f"{len(period_df):,} transactions from the last {period_days} days "
+         f"({period_df['date'].min().date()} to {period_df['date'].max().date()})."
+         if len(period_df) else f"No transactions in the last {period_days} days.",
+         None, None)
 
-        if pct_wknd > 50:
-            recommendations.append(
-                f"More than half of your {top_cat} spending happens on weekends. "
-                f"Consider whether a weekend budget for this category would help."
-            )
+    cards.sort(key=lambda c: -c["priority"])
+    return cards
 
-    # ── Anomalies ──────────────────────────────────────────────────────────
-    anomaly_count = int(anomaly_result.get("anomaly_count", 0))
-    anomalies = anomaly_result.get("anomalies", [])
-
-    if anomaly_count == 0:
-        insights.append(
-            "All your transactions look consistent with your normal spending habits. "
-            "No unusual activity was detected."
-        )
-    else:
-        insights.append(
-            f"We found {anomaly_count} transaction{'s' if anomaly_count > 1 else ''} "
-            f"that look unusual compared to your own recent spending and typical patterns. "
-            f"They could be legitimate but are worth a quick check."
-        )
-        if anomalies:
-            top = anomalies[0]
-            recommendations.append(
-                f"Your most unusual transaction is KSh {top['amount']:,.0f} "
-                f"spent on {top['category']} on {top['date']}. "
-                f"Check the Anomalies tab to confirm this was you."
-            )
-
-    # ── Forecast ──────────────────────────────────────────────────────────
-    if prediction_result.get("status") == "ok":
-        preds = prediction_result.get("predictions", [])
-        pred_amounts = [float(p["predicted_spend_kes"]) for p in preds]
-        historical_avg = float(prediction_result["average_weekly_spend_kes"])
-
-        if pred_amounts:
-            pred_avg = float(np.mean(pred_amounts))
-            next_week = preds[0]
-
-            insights.append(
-                f"Based on your spending history, you are likely to spend around "
-                f"KSh {next_week['predicted_spend_kes']:,.0f} next week."
-            )
-
-            if historical_avg > 0:
-                change_pct = (pred_avg - historical_avg) / historical_avg * 100
-                if change_pct > 10:
-                    insights.append(
-                        f"This is {change_pct:.0f}% higher than your usual weekly average "
-                        f"of KSh {historical_avg:,.0f}."
-                    )
-                    recommendations.append(
-                        "Your predicted spending for the coming weeks is higher than usual. "
-                        "Check whether any large planned expenses are driving this, "
-                        "and consider where you can cut back."
-                    )
-                elif change_pct < -10:
-                    insights.append(
-                        f"This is {abs(change_pct):.0f}% lower than your usual weekly average "
-                        f"of KSh {historical_avg:,.0f}. You seem to be on track to spend less."
-                    )
-                else:
-                    insights.append(
-                        f"This is in line with your usual weekly average of KSh {historical_avg:,.0f}."
-                    )
-    else:
-        insights.append(
-            "We do not have enough weekly history yet to make a spending forecast. "
-            "Keep recording transactions and a forecast will appear automatically."
-        )
-        recommendations.append(
-            "Record at least 4 weeks of transactions to unlock weekly spending predictions."
-        )
-
-    return {"insights": insights, "recommendations": recommendations}
 
 # ── API route ────────────────────────────────────────────────────────────────
 
 @router.get("/{user_id}")
 def analyse_user(
     user_id: int,
+    days: int = Query(90, ge=7, le=3650, description="Period to describe, in days"),
     db: Session = Depends(get_db),
     current_user_id: int = Depends(get_current_user_id),
 ):
     """
     Run the full analysis pipeline for one user.
+
+    The whole history is used to build features and the forecast, but habits,
+    category figures and insights describe only the last `days` days, so
+    totals do not keep growing as the app is used.
     At least five transactions are required for the overall analysis.
     Forecasting has a separate minimum of four observed weeks.
     """
@@ -665,29 +844,35 @@ def analyse_user(
             ),
         )
 
-    # IMPORTANT:
-    # This example assumes all rows fetched here represent spending outflows.
-    # If your database also stores income/incoming transfers, filter those out
-    # according to your actual transaction_type values before running analysis.
+    period_end = df["date"].max()
+    period_start = period_end - pd.Timedelta(days=days - 1)
+    period_df = df[df["date"] >= period_start]
 
-    clustering = run_clustering(df)
+    clustering = run_clustering(df, period_start)
     anomaly_result = run_anomaly_detection(df)
     prediction_result = run_prediction(df)
+    recurring = detect_recurring(df)
 
-    insight_results = generate_insights_and_recommendations(
-        df=df,
-        clustering=clustering,
-        anomaly_result=anomaly_result,
-        prediction_result=prediction_result,
-    )
+    cards = build_insight_cards(period_df, days, clustering, anomaly_result,
+                                prediction_result, recurring)
 
     return {
         "user_id": user_id,
-        "transaction_count": int(len(df)),
+        "transaction_count": int(len(period_df)),
+        "total_transaction_count": int(len(df)),
+        "period": {
+            "days": days,
+            "start": str(period_start.date()),
+            "end": str(period_end.date()),
+            "total_spend_kes": round(float(period_df["amount"].sum()), 2),
+        },
         "analysis_timestamp": datetime.now().isoformat(),
         "spending_clusters": clustering,
         "anomaly_detection": anomaly_result,
         "spending_prediction": prediction_result,
-        "insights": insight_results["insights"],
-        "recommendations": insight_results["recommendations"],
+        "recurring_payments": recurring,
+        "insight_cards": cards,
+        # Plain lists kept for older app versions
+        "insights": [f"{c['title']}. {c['detail']}" for c in cards],
+        "recommendations": [c["action"] for c in cards if c["action"]],
     }

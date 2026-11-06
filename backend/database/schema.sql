@@ -23,12 +23,17 @@ CREATE TABLE users (
     created_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- The 17 standard spending categories (seeded in section 4).
+-- The 17 standard spending categories (seeded below) have user_id NULL and are
+-- shared by everyone. Categories a user creates have their user_id and are
+-- only visible to that user. Names are unique per user (see the index below).
 CREATE TABLE categories (
     category_id SERIAL PRIMARY KEY,
-    name        VARCHAR(50) NOT NULL UNIQUE,
-    icon        VARCHAR(10)
+    name        VARCHAR(50) NOT NULL,
+    icon        VARCHAR(10),
+    user_id     INT REFERENCES users(user_id) ON DELETE CASCADE
 );
+CREATE UNIQUE INDEX uq_categories_owner_name
+    ON categories (COALESCE(user_id, 0), LOWER(name));
 
 -- One row per spending transaction (from SMS or entered manually).
 CREATE TABLE transactions (

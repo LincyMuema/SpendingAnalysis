@@ -94,6 +94,7 @@ def health():
 from routes.authentication import router as auth_router
 from routes.transactions import router as transactions_router
 from routes.analysis import router as analysis_router
+from routes.categories import router as categories_router
 
 app.include_router(
     auth_router,
@@ -104,6 +105,11 @@ app.include_router(
     transactions_router,
     prefix="/transactions",
     tags=["Transactions"]
+)
+app.include_router(
+    categories_router,
+    prefix="/categories",
+    tags=["Categories"]
 )
 app.include_router(
     analysis_router,

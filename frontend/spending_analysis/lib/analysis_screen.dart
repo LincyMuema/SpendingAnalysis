@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'api_service.dart';
+import 'app_events.dart';
 
 class AnalysisScreen extends StatefulWidget {
   final int userId;
@@ -16,17 +17,31 @@ class _AnalysisScreenState extends State<AnalysisScreen>
   bool _isLoading = true;
   String? _error;
 
+
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 4, vsync: this);
+    _tabController = TabController(length: 5, vsync: this);
     _loadAnalysis();
+    // The Home insight card can ask for a specific tab
+    AppEvents.openAnalysisTab.addListener(_onOpenTab);
   }
 
   @override
   void dispose() {
+    AppEvents.openAnalysisTab.removeListener(_onOpenTab);
     _tabController.dispose();
     super.dispose();
+  }
+
+  void _onOpenTab() {
+    final tab = AppEvents.openAnalysisTab.value;
+    if (tab != null && tab >= 0 && tab < 5) _tabController.animateTo(tab);
+  }
+
+  void _openTabByName(String? name) {
+    final tab = AnalysisTabs.fromName(name);
+    if (tab != null) _tabController.animateTo(tab);
   }
 
   Future<void> _loadAnalysis() async {
@@ -35,23 +50,20 @@ class _AnalysisScreenState extends State<AnalysisScreen>
       _error = null;
     });
     try {
-      final result = await ApiService.getAnalysis(userId: widget.userId);
+      // Insights describe the last 3 months; Habits can switch period itself
+      final result = await ApiService.getAnalysis(userId: widget.userId, days: 90);
+      if (!mounted) return;
       setState(() {
         _data = result;
         _isLoading = false;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _error = e.toString().replaceAll('Exception: ', '');
         _isLoading = false;
       });
     }
-  }
-
-  String _fmt(double v) {
-    if (v >= 1000000) return 'KSh ${(v / 1000000).toStringAsFixed(1)}M';
-    if (v >= 1000) return 'KSh ${(v / 1000).toStringAsFixed(1)}k';
-    return 'KSh ${v.toStringAsFixed(0)}';
   }
 
   @override
@@ -82,11 +94,14 @@ class _AnalysisScreenState extends State<AnalysisScreen>
                 unselectedLabelColor: Colors.black38,
                 indicatorColor: const Color(0xFF5B2EFF),
                 indicatorWeight: 2,
+                isScrollable: true,
+                tabAlignment: TabAlignment.start,
                 labelStyle: const TextStyle(
-                    fontSize: 11, fontWeight: FontWeight.w600),
+                    fontSize: 12, fontWeight: FontWeight.w600),
                 tabs: const [
                   Tab(text: 'Insights'),
                   Tab(text: 'Habits'),
+                  Tab(text: 'Recurring'),
                   Tab(text: 'Anomalies'),
                   Tab(text: 'Forecast'),
                 ],
@@ -100,8 +115,9 @@ class _AnalysisScreenState extends State<AnalysisScreen>
               : TabBarView(
                   controller: _tabController,
                   children: [
-                    _InsightsTab(data: _data!),
+                    _InsightsTab(data: _data!, onOpenTab: _openTabByName),
                     _ClustersTab(data: _data!, fmt: _fmt),
+                    _RecurringTab(data: _data!, fmt: _fmt),
                     _AnomaliesTab(data: _data!, fmt: _fmt),
                     _ForecastTab(data: _data!, fmt: _fmt),
                   ],
@@ -186,276 +202,473 @@ class _AnalysisScreenState extends State<AnalysisScreen>
 }
 
 // ── Insights Tab ────────────────────────────────────────────────────────────
+// One ranked list: each card says what we noticed and what to do about it,
+// most important first. Tapping a card opens the tab with the details.
 
 class _InsightsTab extends StatefulWidget {
   final Map<String, dynamic> data;
-  const _InsightsTab({required this.data});
+  final void Function(String? tab) onOpenTab;
+  const _InsightsTab({required this.data, required this.onOpenTab});
 
   @override
   State<_InsightsTab> createState() => _InsightsTabState();
 }
 
 class _InsightsTabState extends State<_InsightsTab> {
-  static const int _previewCount = 3;
-  bool _showAllInsights = false;
-  bool _showAllRecs = false;
+  static const int _previewCount = 5;
+  bool _showAll = false;
 
-  Widget _section({
-    required List<String> items,
-    required bool expanded,
-    required VoidCallback onToggle,
-    required bool isInsight,
-    required Color color,
-  }) {
-    final visible = expanded ? items : items.take(_previewCount).toList();
-    final hidden = items.length - _previewCount;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+  static const _styles = {
+    'alert': (Icons.warning_amber_rounded, Color(0xFFFF9800)),
+    'forecast': (Icons.trending_up_rounded, Color(0xFF5B2EFF)),
+    'subscription': (Icons.autorenew_rounded, Color(0xFFE91E63)),
+    'category': (Icons.pie_chart_outline, Color(0xFF00BCD4)),
+    'habit': (Icons.donut_large_outlined, Color(0xFF4CAF50)),
+    'info': (Icons.info_outline, Color(0xFF9E9E9E)),
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final cards = List<Map<String, dynamic>>.from(
+        (widget.data['insight_cards'] as List? ?? [])
+            .map((c) => Map<String, dynamic>.from(c as Map)));
+
+    // Older backend: fall back to the plain list of insights
+    if (cards.isEmpty) {
+      for (final text in List<String>.from(widget.data['insights'] ?? [])) {
+        cards.add({'type': 'info', 'title': text, 'detail': '', 'action': null, 'tab': null});
+      }
+    }
+    if (cards.isEmpty) {
+      return _EmptyState(
+          icon: Icons.lightbulb_outline,
+          message: 'No insights yet',
+          subtext: 'Add more transactions and check back.');
+    }
+
+    final visible = _showAll ? cards : cards.take(_previewCount).toList();
+    final hidden = cards.length - _previewCount;
+    final period = Map<String, dynamic>.from(widget.data['period'] ?? {});
+    final txCount = widget.data['transaction_count'] as int? ?? 0;
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
       children: [
-        ...visible.asMap().entries.map(
-              (e) => _InsightCard(
-                index: e.key + 1,
-                text: e.value,
-                isInsight: isInsight,
+        Text(
+          period['start'] != null
+              ? 'Last 3 months: $txCount transactions, ${period['start']} to ${period['end']}. Most important first.'
+              : 'Most important first.',
+          style: const TextStyle(color: Colors.black45, fontSize: 12),
+        ),
+        const SizedBox(height: 12),
+        ...visible.map((c) {
+          final style = _styles[c['type']] ?? _styles['info']!;
+          final icon = style.$1;
+          final color = style.$2;
+          final tab = c['tab'] as String?;
+          final action = c['action'] as String?;
+          final detail = (c['detail'] as String?) ?? '';
+
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Material(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(16),
+                onTap: tab == null ? null : () => widget.onOpenTab(tab),
+                child: Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border(left: BorderSide(color: color, width: 4)),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Container(
+                        width: 34,
+                        height: 34,
+                        decoration: BoxDecoration(
+                          color: color.withOpacity(0.12),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Icon(icon, color: color, size: 19),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(c['title'] as String? ?? '',
+                                style: const TextStyle(
+                                    color: Color(0xFF1A1A2E),
+                                    fontWeight: FontWeight.w600,
+                                    fontSize: 14,
+                                    height: 1.3)),
+                            if (detail.isNotEmpty) ...[
+                              const SizedBox(height: 4),
+                              Text(detail,
+                                  style: const TextStyle(
+                                      color: Colors.black54, fontSize: 12.5, height: 1.4)),
+                            ],
+                            if (action != null && action.isNotEmpty) ...[
+                              const SizedBox(height: 8),
+                              Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Icon(Icons.tips_and_updates_outlined, size: 14, color: color),
+                                  const SizedBox(width: 6),
+                                  Expanded(
+                                    child: Text(action,
+                                        style: TextStyle(
+                                            color: color,
+                                            fontSize: 12.5,
+                                            fontWeight: FontWeight.w600,
+                                            height: 1.4)),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                      if (tab != null)
+                        const Padding(
+                          padding: EdgeInsets.only(left: 4),
+                          child: Icon(Icons.chevron_right, color: Colors.black26),
+                        ),
+                    ],
+                  ),
+                ),
               ),
             ),
+          );
+        }),
         if (hidden > 0)
           Center(
             child: TextButton.icon(
-              onPressed: onToggle,
-              icon: Icon(
-                expanded ? Icons.expand_less : Icons.expand_more,
-                color: color,
-                size: 20,
-              ),
-              label: Text(
-                expanded ? 'Show less' : 'Show $hidden more',
-                style: TextStyle(color: color, fontWeight: FontWeight.w600),
-              ),
+              onPressed: () => setState(() => _showAll = !_showAll),
+              icon: Icon(_showAll ? Icons.expand_less : Icons.expand_more,
+                  color: const Color(0xFF5B2EFF), size: 20),
+              label: Text(_showAll ? 'Show less' : 'Show $hidden more',
+                  style: const TextStyle(
+                      color: Color(0xFF5B2EFF), fontWeight: FontWeight.w600)),
             ),
           ),
       ],
     );
   }
-
-  @override
-  Widget build(BuildContext context) {
-    final data = widget.data;
-    final insights = List<String>.from(data['insights'] ?? []);
-    final recs = List<String>.from(data['recommendations'] ?? []);
-    final txCount = data['transaction_count'] as int? ?? 0;
-    final timestamp = data['analysis_timestamp'] as String? ?? '';
-
-    String timeLabel = '';
-    if (timestamp.isNotEmpty) {
-      try {
-        final dt = DateTime.parse(timestamp);
-        timeLabel =
-            '${dt.day}/${dt.month}/${dt.year} at ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
-      } catch (_) {}
-    }
-
-    const insightColor = Color(0xFFFF9800);
-    const recColor = Color(0xFF5B2EFF);
-
-    return RefreshIndicator(
-      color: recColor,
-      onRefresh: () async {},
-      child: ListView(
-        padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
-        children: [
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              _Chip(
-                icon: Icons.receipt_long_outlined,
-                label: '$txCount transactions',
-              ),
-              if (timeLabel.isNotEmpty)
-                _Chip(icon: Icons.access_time, label: timeLabel),
-            ],
-          ),
-          const SizedBox(height: 20),
-
-          // What we noticed
-          const _SectionHeader(
-            icon: Icons.lightbulb_outline,
-            label: 'What we noticed',
-            color: insightColor,
-          ),
-          const SizedBox(height: 10),
-          _section(
-            items: insights,
-            expanded: _showAllInsights,
-            onToggle: () =>
-                setState(() => _showAllInsights = !_showAllInsights),
-            isInsight: true,
-            color: insightColor,
-          ),
-
-          if (recs.isNotEmpty) ...[
-            const SizedBox(height: 16),
-            const _SectionHeader(
-              icon: Icons.tips_and_updates_outlined,
-              label: 'What you can do',
-              color: recColor,
-            ),
-            const SizedBox(height: 10),
-            _section(
-              items: recs,
-              expanded: _showAllRecs,
-              onToggle: () => setState(() => _showAllRecs = !_showAllRecs),
-              isInsight: false,
-              color: recColor,
-            ),
-          ],
-        ],
-      ),
-    );
-  }
 }
 
-class _InsightCard extends StatelessWidget {
-  final int index;
-  final String text;
-  final bool isInsight;
-  const _InsightCard(
-      {required this.index, required this.text, required this.isInsight});
+// ── Recurring Tab ────────────────────────────────────────────────────────────
+// Regular payments to the same payee (subscriptions, rent, bills), found by
+// rules in the backend: same payee, similar amount, regular gap.
+
+class _RecurringTab extends StatelessWidget {
+  final Map<String, dynamic> data;
+  final String Function(double) fmt;
+  const _RecurringTab({required this.data, required this.fmt});
+
+  static const _months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                          'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  String _date(String? iso) {
+    final d = DateTime.tryParse(iso ?? '');
+    return d == null ? '' : '${d.day} ${_months[d.month - 1]}';
+  }
+
+  Widget _badge(String text, Color color) => Container(
+        margin: const EdgeInsets.only(right: 6, top: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: color.withOpacity(0.12),
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Text(text,
+            style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w600)),
+      );
 
   @override
   Widget build(BuildContext context) {
-    final color =
-        isInsight ? const Color(0xFFFF9800) : const Color(0xFF5B2EFF);
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        boxShadow: [
-          BoxShadow(
-              color: Colors.black.withOpacity(0.04),
-              blurRadius: 6,
-              offset: const Offset(0, 2))
-        ],
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            width: 28,
-            height: 28,
-            decoration: BoxDecoration(
-              color: color.withOpacity(0.12),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Center(
-              child: Text(
-                '$index',
-                style: TextStyle(
-                    color: color,
-                    fontSize: 12,
-                    fontWeight: FontWeight.bold),
+    final rec = Map<String, dynamic>.from(data['recurring_payments'] ?? {});
+    final items = List<Map<String, dynamic>>.from(
+        (rec['payments'] as List? ?? []).map((e) => Map<String, dynamic>.from(e as Map)));
+
+    if (items.isEmpty) {
+      return _EmptyState(
+          icon: Icons.autorenew_rounded,
+          message: 'No regular payments found yet',
+          subtext:
+              'Payments to the same place for a similar amount every week or month will appear here. '
+              'At least two payments are needed.');
+    }
+
+    double num_(Map<String, dynamic> m, String k) => (m[k] as num?)?.toDouble() ?? 0;
+    const pink = Color(0xFFE91E63);
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
+      children: [
+        // Summary
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: pink,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Regular payments',
+                  style: TextStyle(color: Colors.white70, fontSize: 12)),
+              const SizedBox(height: 4),
+              Text('${fmt(num_(rec, 'monthly_total_kes'))} a month',
+                  style: const TextStyle(
+                      color: Colors.white, fontSize: 22, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              Text(
+                  '${rec['active_count'] ?? items.length} active  •  ${fmt(num_(rec, 'yearly_total_kes'))} a year',
+                  style: const TextStyle(color: Colors.white70, fontSize: 12)),
+            ],
+          ),
+        ),
+        const SizedBox(height: 8),
+        const Text(
+          'Found from your history: the same payee, a similar amount, at a regular interval. '
+          'Cancel any you no longer use.',
+          style: TextStyle(color: Colors.black45, fontSize: 12, height: 1.4),
+        ),
+        const SizedBox(height: 14),
+
+        ...items.map((r) {
+          final status = r['status'] as String? ?? 'active';
+          final change = r['price_change'] as Map?;
+          final stopped = status == 'may_have_stopped';
+
+          return Opacity(
+            opacity: stopped ? 0.6 : 1,
+            child: Container(
+              margin: const EdgeInsets.only(bottom: 12),
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: [
+                  BoxShadow(
+                      color: Colors.black.withOpacity(0.04),
+                      blurRadius: 8,
+                      offset: const Offset(0, 2))
+                ],
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(r['name'] as String? ?? '',
+                            style: const TextStyle(
+                                color: Color(0xFF1A1A2E),
+                                fontWeight: FontWeight.bold,
+                                fontSize: 15)),
+                      ),
+                      Text(fmt(num_(r, 'usual_amount_kes')),
+                          style: const TextStyle(
+                              color: Color(0xFF1A1A2E),
+                              fontWeight: FontWeight.bold,
+                              fontSize: 15)),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    '${r['frequency']}  •  ${r['category']}  •  ${fmt(num_(r, 'yearly_cost_kes'))} a year',
+                    style: const TextStyle(color: Colors.black54, fontSize: 12),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    stopped
+                        ? 'Last paid ${_date(r['last_date'] as String?)}. No payment since, so it may have stopped.'
+                        : 'Last paid ${_date(r['last_date'] as String?)}  •  next expected around ${_date(r['next_expected_date'] as String?)}',
+                    style: const TextStyle(color: Colors.black45, fontSize: 12),
+                  ),
+                  Wrap(
+                    children: [
+                      if (status == 'due_soon') _badge('Due soon', const Color(0xFFFF9800)),
+                      if (r['is_new'] == true) _badge('New', const Color(0xFF5B2EFF)),
+                      if (change != null)
+                        _badge(
+                            'Price ${(change['to'] as num) > (change['from'] as num) ? 'up' : 'down'}: '
+                            '${fmt((change['from'] as num).toDouble())} → ${fmt((change['to'] as num).toDouble())}',
+                            (change['to'] as num) > (change['from'] as num)
+                                ? const Color(0xFFE53935)
+                                : const Color(0xFF4CAF50)),
+                      if (stopped) _badge('May have stopped', Colors.black45),
+                    ],
+                  ),
+                ],
               ),
             ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              text,
-              style: const TextStyle(
-                  color: Color(0xFF1A1A2E), fontSize: 13, height: 1.5),
-            ),
-          ),
-        ],
-      ),
+          );
+        }),
+      ],
     );
   }
 }
 
 // ── Habits Tab (formerly Clusters) ──────────────────────────────────────────
 
-class _ClustersTab extends StatelessWidget {
+class _ClustersTab extends StatefulWidget {
   final Map<String, dynamic> data;
   final String Function(double) fmt;
   const _ClustersTab({required this.data, required this.fmt});
 
   @override
+  State<_ClustersTab> createState() => _ClustersTabState();
+}
+
+class _ClustersTabState extends State<_ClustersTab> {
+  // The backend sends habits for each period, so switching is instant
+  static const _periods = {30: '1 month', 90: '3 months', 180: '6 months', 365: '1 year'};
+  int _days = 90;
+
+  Map<String, dynamic> get data => widget.data;
+  String Function(double) get fmt => widget.fmt;
+
+  Widget _periodChips() {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: _periods.entries.map((p) {
+        final selected = _days == p.key;
+        return ChoiceChip(
+          label: Text(p.value),
+          selected: selected,
+          showCheckmark: false,
+          selectedColor: const Color(0xFF5B2EFF),
+          backgroundColor: Colors.white,
+          labelStyle: TextStyle(
+            color: selected ? Colors.white : Colors.black54,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+          ),
+          side: BorderSide(color: selected ? const Color(0xFF5B2EFF) : Colors.black12),
+          onSelected: (_) => setState(() => _days = p.key),
+        );
+      }).toList(),
+    );
+  }
+
+  static const _colors = [
+    Color(0xFF5B2EFF),
+    Color(0xFF00BCD4),
+    Color(0xFFFF9800),
+    Color(0xFF4CAF50),
+    Color(0xFFE91E63),
+  ];
+
+  static IconData _iconFor(String name) {
+    final n = name.toLowerCase();
+    if (n.contains('big')) return Icons.shopping_bag_outlined;
+    if (n.contains('bill')) return Icons.receipt_long_outlined;
+    if (n.contains('weekend')) return Icons.weekend_outlined;
+    if (n.contains('first-time')) return Icons.fiber_new_outlined;
+    if (n.contains('small')) return Icons.local_cafe_outlined;
+    return Icons.payments_outlined;
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final clustering =
-        Map<String, dynamic>.from(data['spending_clusters'] ?? {});
-    final clusters =
-        Map<String, dynamic>.from(clustering['clusters'] ?? {});
+    final clustering = Map<String, dynamic>.from(data['spending_clusters'] ?? {});
+    final byPeriod = Map<String, dynamic>.from(clustering['by_period'] ?? {});
+    final periodData = byPeriod['$_days'] != null
+        ? Map<String, dynamic>.from(byPeriod['$_days'] as Map)
+        : null;
+    // Older backend without periods: use the single set of clusters
+    final clusters = Map<String, dynamic>.from(
+        (periodData?['clusters'] ?? clustering['clusters'] ?? {}) as Map);
 
     if (clusters.isEmpty) {
-      return _EmptyState(
-          icon: Icons.donut_large_outlined,
-          message: 'No spending habits found yet',
-          subtext: 'Add more transactions and check back.');
+      return ListView(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
+        children: [
+          if (byPeriod.isNotEmpty) _periodChips(),
+          const SizedBox(height: 40),
+          _EmptyState(
+              icon: Icons.donut_large_outlined,
+              message: 'No spending habits in this period',
+              subtext: 'Choose a longer period or add more transactions.'),
+        ],
+      );
     }
 
-    const clusterColors = [
-      Color(0xFF5B2EFF),
-      Color(0xFF00BCD4),
-      Color(0xFFFF9800),
-      Color(0xFF4CAF50),
-      Color(0xFFE91E63),
-    ];
+    double numOf(Map<String, dynamic> c, String k) => (c[k] as num?)?.toDouble() ?? 0;
 
-    final list = clusters.values
-        .map((v) => Map<String, dynamic>.from(v as Map))
-        .toList();
-
-    double numOf(Map<String, dynamic> c, String k) =>
-        (c[k] as num?)?.toDouble() ?? 0;
+    final list = clusters.values.map((v) => Map<String, dynamic>.from(v as Map)).toList()
+      // Biggest share of money first
+      ..sort((a, b) => numOf(b, 'total_spend_kes').compareTo(numOf(a, 'total_spend_kes')));
 
     final totalAll = list.fold<double>(0, (s, c) => s + numOf(c, 'total_spend_kes'));
-    final avgs = list.map((c) => numOf(c, 'avg_amount_kes')).toList();
-    final maxAvg = avgs.reduce((a, b) => a > b ? a : b);
-    final minAvg = avgs.reduce((a, b) => a < b ? a : b);
-
-    // Order by share of money, biggest first
-    list.sort((a, b) =>
-        numOf(b, 'total_spend_kes').compareTo(numOf(a, 'total_spend_kes')));
-
-    String habitName(double avg) {
-      if (list.length > 1 && avg == maxAvg) return 'Big purchases';
-      if (list.length > 1 && avg == minAvg) return 'Small everyday spends';
-      return 'Regular spending';
-    }
-
-    String whenText(double pctWeekend) {
-      if (pctWeekend >= 50) return 'Mostly on weekends';
-      if (pctWeekend <= 15) return 'Mostly on weekdays';
-      return 'Spread across the week';
-    }
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
       children: [
         const _SectionHeader(
           icon: Icons.donut_large_outlined,
-          label: 'How you spend',
+          label: 'Your spending habits',
           color: Color(0xFF5B2EFF),
         ),
         const SizedBox(height: 6),
         const Text(
-          'We grouped your payments into habits, so you can see where your money goes.',
+          'Payments that look alike (similar amount, timing and type) are grouped into habits. '
+          'Biggest share of your money first.',
           style: TextStyle(color: Colors.black45, fontSize: 12, height: 1.4),
         ),
+        if (byPeriod.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          _periodChips(),
+        ],
+        if (periodData != null) ...[
+          const SizedBox(height: 10),
+          Text(
+            '${periodData['transaction_count']} payments, '
+            '${fmt((periodData['total_spend_kes'] as num).toDouble())} in total',
+            style: const TextStyle(
+                color: Color(0xFF1A1A2E), fontSize: 13, fontWeight: FontWeight.w600),
+          ),
+        ],
         const SizedBox(height: 16),
         ...list.asMap().entries.map((entry) {
-          final idx = entry.key;
+          final color = _colors[entry.key % _colors.length];
           final c = entry.value;
-          final color = clusterColors[idx % clusterColors.length];
 
-          final txCount = c['transaction_count'] as int? ?? 0;
-          final avg = numOf(c, 'avg_amount_kes');
+          final name = c['habit_name'] as String? ?? 'Spending habit';
+          final count = c['transaction_count'] as int? ?? 0;
           final total = numOf(c, 'total_spend_kes');
-          final pctWeekend = numOf(c, 'pct_weekend');
-          final topCat = c['top_category'] as String? ?? 'Other';
-          final share = totalAll > 0 ? total / totalAll : 0.0;
+          final share = c['share_of_spend_pct'] != null
+              ? numOf(c, 'share_of_spend_pct') / 100
+              : (totalAll > 0 ? total / totalAll : 0.0);
+          final low = numOf(c, 'typical_low_kes');
+          final high = numOf(c, 'typical_high_kes');
+          final avg = numOf(c, 'avg_amount_kes');
+          final day = c['busiest_day'] as String?;
+          final source = c['main_source'] as String?;
+          final cats = List<Map<String, dynamic>>.from(
+              (c['top_categories'] as List?)?.map((e) => Map<String, dynamic>.from(e as Map)) ??
+                  [
+                    {'name': c['top_category'] ?? 'Other', 'pct': 100}
+                  ]);
+          final merchants = List<String>.from(c['top_merchants'] ?? const []);
+
+          // "65 payments, usually KSh 800–1.8k, most often on Saturday, mostly by card."
+          final parts = <String>[
+            '$count payment${count == 1 ? '' : 's'}',
+            (low > 0 && high > 0 && high > low)
+                ? 'usually ${fmt(low)}–${fmt(high)}'
+                : 'about ${fmt(avg)} each',
+            if (day != null) 'most often on ${day}s',
+            if (source != null) 'mostly by $source',
+          ];
+          final summary = '${parts.join(', ')}.';
 
           return Container(
             margin: const EdgeInsets.only(bottom: 14),
@@ -473,63 +686,87 @@ class _ClustersTab extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                // Name and share of money
                 Row(
                   children: [
                     Container(
-                      width: 10,
-                      height: 10,
-                      decoration:
-                          BoxDecoration(color: color, shape: BoxShape.circle),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        habitName(avg),
-                        style: const TextStyle(
-                            color: Color(0xFF1A1A2E),
-                            fontWeight: FontWeight.bold,
-                            fontSize: 15),
-                      ),
-                    ),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 3),
+                      width: 36,
+                      height: 36,
                       decoration: BoxDecoration(
                         color: color.withOpacity(0.12),
-                        borderRadius: BorderRadius.circular(20),
+                        borderRadius: BorderRadius.circular(10),
                       ),
-                      child: Text(
-                        topCat,
-                        style: TextStyle(
-                            color: color,
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600),
-                      ),
+                      child: Icon(_iconFor(name), color: color, size: 20),
                     ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(name,
+                          style: const TextStyle(
+                              color: Color(0xFF1A1A2E),
+                              fontWeight: FontWeight.bold,
+                              fontSize: 15)),
+                    ),
+                    Text('${(share * 100).toStringAsFixed(0)}%',
+                        style: TextStyle(
+                            color: color, fontWeight: FontWeight.bold, fontSize: 16)),
                   ],
                 ),
-                const SizedBox(height: 12),
-                Text(
-                  '${(share * 100).toStringAsFixed(0)}% of your spending  •  ${fmt(total)}',
-                  style: TextStyle(
-                      color: color, fontWeight: FontWeight.w600, fontSize: 13),
-                ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 10),
                 ClipRRect(
                   borderRadius: BorderRadius.circular(6),
                   child: LinearProgressIndicator(
                     value: share.clamp(0.0, 1.0),
-                    minHeight: 8,
+                    minHeight: 6,
                     backgroundColor: color.withOpacity(0.1),
                     valueColor: AlwaysStoppedAnimation<Color>(color),
                   ),
                 ),
+                const SizedBox(height: 6),
+                Text('${fmt(total)} of your spending',
+                    style: const TextStyle(color: Colors.black45, fontSize: 11)),
                 const SizedBox(height: 12),
-                Text(
-                  '$txCount payments, usually around ${fmt(avg)} each. ${whenText(pctWeekend)}.',
-                  style: const TextStyle(
-                      color: Colors.black54, fontSize: 12, height: 1.5),
+
+                // What, when, how
+                Text(summary,
+                    style: const TextStyle(
+                        color: Color(0xFF1A1A2E), fontSize: 13, height: 1.45)),
+                const SizedBox(height: 10),
+
+                // Category mix
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: cats
+                      .map((cat) => Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: color.withOpacity(0.08),
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: Text('${cat['name']} ${cat['pct']}%',
+                                style: TextStyle(
+                                    color: color,
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600)),
+                          ))
+                      .toList(),
                 ),
+
+                // Example places
+                if (merchants.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Icon(Icons.storefront_outlined, size: 14, color: Colors.black38),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(merchants.join(', '),
+                            style: const TextStyle(color: Colors.black54, fontSize: 12)),
+                      ),
+                    ],
+                  ),
+                ],
               ],
             ),
           );
@@ -581,6 +818,7 @@ class _AnomaliesTabState extends State<_AnomaliesTab> {
     setState(() => _busy.add(id));
     try {
       await ApiService.dismissAnomaly(transactionId: id);
+      AppEvents.notifyTransactionsChanged(); // lets the Home card update
       if (!mounted) return;
       setState(() {
         _anomalies.removeWhere((x) => x['transaction_id'] == id);
@@ -829,10 +1067,13 @@ class _ForecastTab extends StatelessWidget {
       );
     }
 
-    // Find max for bar scaling
+    // Scale bars so both the tallest bar and the average line fit
     final maxPred = predictions
         .map((p) => (p['predicted_spend_kes'] as num?)?.toDouble() ?? 0)
         .reduce((a, b) => a > b ? a : b);
+    final scaleMax = maxPred > avgWeekly ? maxPred : avgWeekly;
+    const barArea = 120.0; // height available to the bars
+    final avgLineY = scaleMax > 0 ? (avgWeekly / scaleMax) * barArea : 0.0;
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
@@ -888,53 +1129,73 @@ class _ForecastTab extends StatelessWidget {
           ),
           child: Column(
             children: [
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: predictions.asMap().entries.map((entry) {
-                  final idx = entry.key;
-                  final p = entry.value;
-                  final amount =
-                      (p['predicted_spend_kes'] as num?)?.toDouble() ?? 0;
-                  final label = p['week_label'] as String? ?? 'Week ${idx + 1}';
-                  // "Week of 03 Nov 2026" → "3 Nov"
-                  final shortLabel = _shortWeekLabel(label, idx);
-                  final barH = maxPred > 0 ? (amount / maxPred) * 120 : 20.0;
+              // Bars with the average weekly spend drawn across them
+              SizedBox(
+                height: barArea + 22, // bars plus the amount above each bar
+                child: Stack(
+                  children: [
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: predictions.asMap().entries.map((entry) {
+                        final idx = entry.key;
+                        final amount = (entry.value['predicted_spend_kes'] as num?)
+                                ?.toDouble() ??
+                            0;
+                        final barH = scaleMax > 0
+                            ? (amount / scaleMax * barArea).clamp(16.0, barArea)
+                            : 16.0;
+                        const barColor = Color(0xFF5B2EFF);
 
-                  const barColor = Color(0xFF5B2EFF);
-
-                  return Expanded(
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 4),
-                      child: Column(
-                        children: [
-                          Text(
-                            fmt(amount),
-                            style: const TextStyle(
-                                color: Color(0xFF1A1A2E),
-                                fontSize: 10,
-                                fontWeight: FontWeight.w600),
-                            textAlign: TextAlign.center,
-                          ),
-                          const SizedBox(height: 6),
-                          Container(
-                            height: barH.clamp(16.0, 120.0),
-                            decoration: BoxDecoration(
-                              color: idx == 0
-                                  ? barColor
-                                  : barColor.withOpacity(0.45 - idx * 0.05),
-                              borderRadius: BorderRadius.circular(6),
+                        return Expanded(
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 4),
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.end,
+                              children: [
+                                Text(
+                                  fmt(amount),
+                                  style: const TextStyle(
+                                      color: Color(0xFF1A1A2E),
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w600),
+                                  textAlign: TextAlign.center,
+                                ),
+                                const SizedBox(height: 6),
+                                Container(
+                                  height: barH,
+                                  decoration: BoxDecoration(
+                                    color: idx == 0
+                                        ? barColor
+                                        : barColor.withOpacity(0.45 - idx * 0.05),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
-                          const SizedBox(height: 8),
-                          Text(
-                            shortLabel,
-                            style: const TextStyle(
-                                color: Colors.black38,
-                                fontSize: 10),
-                            textAlign: TextAlign.center,
-                          ),
-                        ],
+                        );
+                      }).toList(),
+                    ),
+                    if (avgWeekly > 0)
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: avgLineY - 1,
+                        child: const _DashedLine(color: Color(0xFFFF9800)),
                       ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: predictions.asMap().entries.map((entry) {
+                  final label =
+                      entry.value['week_label'] as String? ?? 'Week ${entry.key + 1}';
+                  return Expanded(
+                    child: Text(
+                      _shortWeekLabel(label, entry.key),
+                      style: const TextStyle(color: Colors.black38, fontSize: 10),
+                      textAlign: TextAlign.center,
                     ),
                   );
                 }).toList(),
@@ -965,6 +1226,17 @@ class _ForecastTab extends StatelessWidget {
                       style: TextStyle(fontSize: 11, color: Colors.black45)),
                 ],
               ),
+              if (avgWeekly > 0) ...[
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    const SizedBox(width: 18, child: _DashedLine(color: Color(0xFFFF9800))),
+                    const SizedBox(width: 6),
+                    Text('Your average week: ${fmt(avgWeekly)}',
+                        style: const TextStyle(fontSize: 11, color: Colors.black45)),
+                  ],
+                ),
+              ],
             ],
           ),
         ),
@@ -1262,6 +1534,33 @@ class _EmptyState extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// A thin horizontal dashed line (used for the average on the forecast chart).
+class _DashedLine extends StatelessWidget {
+  final Color color;
+  const _DashedLine({required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        const dash = 6.0, gap = 4.0;
+        final count = (constraints.maxWidth / (dash + gap)).floor().clamp(1, 1000);
+        return Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: List.generate(
+            count,
+            (_) => SizedBox(
+              width: dash,
+              height: 2,
+              child: DecoratedBox(decoration: BoxDecoration(color: color)),
+            ),
+          ),
+        );
+      },
     );
   }
 }
