@@ -6,6 +6,7 @@ Runs spending pattern analysis, anomaly detection, predictions,
 and generates user-friendly insights and recommendations.
 """
 
+import json
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -64,6 +65,14 @@ ANOMALY_MAX_SHOWN = 5
 RECURRING_GAP_DAYS = (25, 35)      # about a month apart
 RECURRING_AMOUNT_TOLERANCE = 0.10  # within 10% of each other
 
+# Time-of-day features (must match the preprocessing notebook)
+UNKNOWN_TIME_HOUR = 12          # payments with no recorded time are placed at midday
+NIGHT_HOURS = (22, 5)           # 22:00 to 04:59 counts as night
+MAX_GAP_MINUTES = 10080         # one week; longer gaps (and the first payment) are capped here
+# Median of log_mins_since_prev in the training data, used when the exact
+# time of a payment is not known
+UNKNOWN_LOG_MINS = 6.83
+
 SOURCE_MAP = {
     "CARD": 0,
     "CASH": 1,
@@ -99,6 +108,7 @@ def fetch_user_transactions(user_id: int, db: Session) -> pd.DataFrame:
                 t.transaction_id,
                 t.amount,
                 t.date,
+                t.occurred_at,
                 t.transaction_type,
                 t.source,
                 t.counterparty,
@@ -107,7 +117,7 @@ def fetch_user_transactions(user_id: int, db: Session) -> pd.DataFrame:
             FROM transactions t
             LEFT JOIN categories c ON t.category_id = c.category_id
             WHERE t.user_id = :user_id
-            ORDER BY t.date ASC, t.transaction_id ASC
+            ORDER BY t.date ASC, t.occurred_at ASC NULLS FIRST, t.transaction_id ASC
             """
         ),
         {"user_id": user_id},
@@ -122,6 +132,7 @@ def fetch_user_transactions(user_id: int, db: Session) -> pd.DataFrame:
             "transaction_id",
             "amount",
             "date",
+            "occurred_at",
             "transaction_type",
             "source",
             "counterparty",
@@ -139,9 +150,17 @@ def fetch_user_transactions(user_id: int, db: Session) -> pd.DataFrame:
 
     df = df.dropna(subset=["date", "amount"])
     df = df[df["amount"] > 0].copy()
-    # Same-day transactions are kept in the order they were recorded, so the
-    # results do not change when rows are updated (e.g. an anomaly is dismissed).
-    df = df.sort_values(["date", "transaction_id"], kind="mergesort").reset_index(drop=True)
+
+    # Full date and time of each payment. Older rows (and manual entries for
+    # past days) have no time, so they are placed at midday and marked, and the
+    # time features that need an exact time are neutralised for them.
+    occurred = pd.to_datetime(df["occurred_at"], errors="coerce")
+    df["time_known"] = occurred.notna()
+    df["ts"] = occurred.where(df["time_known"], df["date"] + pd.Timedelta(hours=UNKNOWN_TIME_HOUR))
+
+    # Payments are kept in time order; ties keep the order they were recorded,
+    # so results do not change when rows are updated (e.g. an anomaly is dismissed).
+    df = df.sort_values(["ts", "transaction_id"], kind="mergesort").reset_index(drop=True)
 
     return df
 
@@ -160,14 +179,15 @@ def add_transaction_features(df: pd.DataFrame) -> pd.DataFrame:
     df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
 
     # These rolling features use only earlier transactions, not the current one.
-    df = df.sort_values("date", kind="mergesort").reset_index(drop=True)
-    date_indexed_amounts = df.set_index("date")["amount"]
+    df = df.sort_values(["ts", "transaction_id"], kind="mergesort").reset_index(drop=True)
+    known = df["time_known"].to_numpy()
+    ts_indexed_amounts = df.set_index("ts")["amount"]
 
     df["7day_spend"] = (
-        date_indexed_amounts.rolling("7D", closed="left").sum().to_numpy()
+        ts_indexed_amounts.rolling("7D", closed="left").sum().to_numpy()
     )
     df["30day_avg"] = (
-        date_indexed_amounts.rolling("30D", closed="left").mean().to_numpy()
+        ts_indexed_amounts.rolling("30D", closed="left").mean().to_numpy()
     )
 
     df["7day_spend"] = df["7day_spend"].fillna(0.0)
@@ -192,6 +212,34 @@ def add_transaction_features(df: pd.DataFrame) -> pd.DataFrame:
     ).replace([np.inf, -np.inf], np.nan).fillna(1.0)
 
     df["is_new_category"] = (prior_in_cat == 0).astype(int)
+
+    # Time of day, as a point on a 24-hour circle (so 23:00 and 01:00 are close)
+    hour = df["ts"].dt.hour + df["ts"].dt.minute / 60
+    df["hour"] = hour
+    df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+    df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+    df["is_night"] = (((hour >= NIGHT_HOURS[0]) | (hour < NIGHT_HOURS[1])) & known).astype(int)
+
+    # How many payments were made in the previous 1 hour and 24 hours
+    df["tx_count_1h"] = ts_indexed_amounts.rolling("1h", closed="left").count().to_numpy()
+    df["tx_count_24h"] = ts_indexed_amounts.rolling("24h", closed="left").count().to_numpy()
+    df["tx_count_1h"] = df["tx_count_1h"].fillna(0.0)
+    df["tx_count_24h"] = df["tx_count_24h"].fillna(0.0)
+
+    # Minutes since the previous payment (log scale, capped at one week)
+    mins = df["ts"].diff().dt.total_seconds() / 60
+    df["log_mins_since_prev"] = np.log1p(mins.fillna(MAX_GAP_MINUTES).clip(upper=MAX_GAP_MINUTES))
+
+    # Same amount in the same category within the previous hour
+    gap_same = df.groupby(["category_name", "amount"])["ts"].diff().dt.total_seconds() / 60
+    df["dup_1h"] = (gap_same <= 60).astype(int)
+
+    # Without an exact time these cannot be measured, so they are set to
+    # "nothing unusual" instead of treating midday as a real time.
+    df.loc[~known, "tx_count_1h"] = 0.0
+    df.loc[~known, "dup_1h"] = 0
+    same_day_unknown = (~known) & (mins.fillna(MAX_GAP_MINUTES) < 24 * 60).to_numpy()
+    df.loc[same_day_unknown, "log_mins_since_prev"] = UNKNOWN_LOG_MINS
 
     return df
 
@@ -271,6 +319,8 @@ def run_clustering(df: pd.DataFrame, period_start=None) -> dict:
         "7day_spend",
         "30day_avg",
         "spending_velocity",
+        "hour_sin",
+        "hour_cos",
     ]
 
     featured_df = add_transaction_features(df)
@@ -308,9 +358,38 @@ DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
 SOURCE_LABELS = {"MPESA": "M-Pesa", "CARD": "card", "CASH": "cash", "WALLET": "wallet"}
 
 
+PARTS_OF_DAY = [  # (name, from hour, to hour)
+    ("morning", 5, 12),
+    ("afternoon", 12, 17),
+    ("evening", 17, 22),
+    ("night", 22, 29),   # 22:00 to 04:59 (hours after midnight are +24)
+]
+
+
+def _part_of_day(hours: pd.Series) -> tuple:
+    """Main part of the day for a group of payments, and its share (0-100)."""
+    if hours.empty:
+        return "", 0.0
+    h = hours.where(hours >= 5, hours + 24)
+    shares = {name: float(((h >= lo) & (h < hi)).mean() * 100) for name, lo, hi in PARTS_OF_DAY}
+    name = max(shares, key=shares.get)
+    return name, shares[name]
+
+
+def _typical_time(hours: pd.Series) -> str | None:
+    """'around 10:30 AM' from the median clock time of the payments."""
+    if hours.empty:
+        return None
+    # Circular mean, so payments at 23:00 and 01:00 average to midnight
+    angle = np.arctan2(np.sin(2 * np.pi * hours / 24).mean(), np.cos(2 * np.pi * hours / 24).mean())
+    mins = int(round((angle / (2 * np.pi) * 24 % 24) * 60 / 15) * 15) % (24 * 60)
+    h, m = divmod(mins, 60)
+    return f"around {(h % 12) or 12}:{m:02d} {'AM' if h < 12 else 'PM'}"
+
+
 def _habit_name(median_amount: float, user_median: float, pct_weekend: float,
                 count_share: float, top_categories: list, bills_count_pct: float,
-                pct_new_category: float) -> str:
+                pct_new_category: float, part_of_day: str = "") -> str:
     """A plain-language name built from what is in the group."""
     main_cat, main_share = (top_categories[0]["name"], top_categories[0]["pct"]) if top_categories else ("", 0)
 
@@ -338,13 +417,15 @@ def _habit_name(median_amount: float, user_median: float, pct_weekend: float,
     else:
         when = ""
 
-    if size and when:
-        return f"{size} {when} {'spends' if size == 'Small' else 'payments'}"
-    if when:
-        return f"{when.capitalize()} spending"
-    if size:
-        return f"{size} {'everyday spends' if size == 'Small' else 'payments'}"
-    return "Everyday spending"
+    # e.g. "Weekday morning spends", "Large weekend evening payments", "Evening spending"
+    words = [w for w in (size, when, part_of_day) if w]
+    if not words:
+        return "Everyday spending"
+    if not (when or part_of_day) and size == "Small":
+        words.append("everyday")
+    noun = "spends" if size == "Small" else "payments" if size == "Large" else "spending"
+    name = " ".join(words + [noun])
+    return name[0].upper() + name[1:]
 
 
 def describe_clusters(featured_df: pd.DataFrame) -> dict:
@@ -375,10 +456,18 @@ def describe_clusters(featured_df: pd.DataFrame) -> dict:
 
         bills_count_pct = float((g["category_name"] == "Bills & Utilities").mean() * 100)
 
+        # Time of day, only from payments whose exact time is known.
+        # A part of the day is named only when most payments fall in it.
+        timed = g.loc[g["time_known"], "hour"]
+        enough_times = len(timed) >= 3 and len(timed) >= 0.5 * len(g)
+        part, part_pct = _part_of_day(timed) if enough_times else ("", 0.0)
+        part_of_day = part if part_pct >= 50 else ""
+
         clusters_out[int(cluster_id)] = {
             "habit_name": _habit_name(median_amount, user_median, pct_weekend, count_share,
                                       top_categories, bills_count_pct,
-                                      float(g["is_new_category"].mean() * 100)),
+                                      float(g["is_new_category"].mean() * 100),
+                                      part_of_day),
             "transaction_count": int(len(g)),
             "avg_amount_kes": round(float(g["amount"].mean()), 2),
             "median_amount_kes": round(median_amount, 2),
@@ -388,6 +477,9 @@ def describe_clusters(featured_df: pd.DataFrame) -> dict:
             "share_of_spend_pct": round(money / total_money * 100, 1),
             "pct_weekend": round(pct_weekend, 1),
             "busiest_day": DAY_NAMES[int(g["day_of_week"].mode().iloc[0])],
+            "part_of_day": part_of_day or None,
+            "part_of_day_pct": round(part_pct, 1) if part_of_day else None,
+            "typical_time": _typical_time(timed) if enough_times else None,
             "main_source": SOURCE_LABELS.get(str(g["source"].mode().iloc[0]).upper(), "M-Pesa"),
             "top_category": top_categories[0]["name"] if top_categories else "Other",
             "top_categories": top_categories,
@@ -420,14 +512,39 @@ def _is_recurring(row, df: pd.DataFrame) -> bool:
     return bool(((gap >= RECURRING_GAP_DAYS[0]) & (gap <= RECURRING_GAP_DAYS[1]) & similar).any())
 
 
+def _fmt_time(row) -> str | None:
+    """'2:14 PM' when the exact time is known, otherwise None."""
+    if not row["time_known"]:
+        return None
+    t = row["ts"]
+    return f"{(t.hour % 12) or 12}:{t.minute:02d} {'AM' if t.hour < 12 else 'PM'}"
+
+
+def _anomaly_reasons(row) -> list:
+    """Plain-language reasons a payment stands out (at most two)."""
+    reasons = []
+    if row["dup_1h"] == 1:
+        reasons.append("The same amount was paid in this category less than an hour before")
+    if row["tx_count_1h"] >= 3:
+        reasons.append(f"{int(row['tx_count_1h'])} other payments in the hour before it")
+    if row["is_night"] == 1:
+        reasons.append(f"Paid late at night ({_fmt_time(row)})")
+    if row["is_new_category"] == 1:
+        reasons.append("Your first payment in this category")
+    if row["cat_amount_ratio"] >= 3:
+        reasons.append(f"About {row['cat_amount_ratio']:.0f}x what you usually pay for {row['category_name']}")
+    elif row["spending_velocity"] >= 3:
+        reasons.append(f"About {row['spending_velocity']:.0f}x your average payment this month")
+    if not reasons:
+        reasons.append("An unusual mix of amount, timing and category for you")
+    return reasons[:2]
+
+
 def run_anomaly_detection(df: pd.DataFrame) -> dict:
     """Flag transactions that the trained Isolation Forest considers unusual."""
     iso_forest = models["isolation_forest_model"]
 
-    # Must match the feature set the training notebook selected (same order).
-    # If the notebook printed "Using: CURRENT", replace this list with:
-    #   ["amount", "category_encoded", "source_encoded", "day_of_week",
-    #    "is_weekend", "spending_velocity"]
+    # Must match the feature set the training notebook selected (same order)
     anomaly_features = [
         "amount",
         "cat_share",
@@ -437,6 +554,13 @@ def run_anomaly_detection(df: pd.DataFrame) -> dict:
         "day_of_week",
         "is_weekend",
         "spending_velocity",
+        "hour_sin",
+        "hour_cos",
+        "is_night",
+        "tx_count_1h",
+        "tx_count_24h",
+        "log_mins_since_prev",
+        "dup_1h",
     ]
 
     featured_df = add_transaction_features(df)
@@ -480,7 +604,10 @@ def run_anomaly_detection(df: pd.DataFrame) -> dict:
                 "transaction_id": int(row["transaction_id"]),
                 "amount": round(float(row["amount"]), 2),
                 "date": str(row["date"].date()),
+                "time": _fmt_time(row),
                 "category": str(row["category_name"]),
+                "counterparty": str(row["counterparty"]).title() if row["counterparty"] else None,
+                "reasons": _anomaly_reasons(row),
                 "source": str(row["source"]),
                 "anomaly_score": round(float(row["anomaly_score"]), 4),
             }
@@ -711,8 +838,9 @@ def build_insight_cards(
         top = anomaly_result["anomalies"][0]
         card(100, "alert",
              f"{n} unusual transaction{'s' if n > 1 else ''} to check",
-             f"The most unusual is {_ksh(top['amount'])} on {top['category']} on {top['date']}, "
-             f"compared with your own spending over the last {days} days.",
+             f"The most unusual is {_ksh(top['amount'])} on {top['category']} on {top['date']}"
+             f"{' at ' + top['time'] if top.get('time') else ''}. "
+             f"{top['reasons'][0]}.",
              "Confirm these were you. Mark any that are normal so they are not flagged again.",
              "anomalies")
 
@@ -856,7 +984,7 @@ def analyse_user(
     cards = build_insight_cards(period_df, days, clustering, anomaly_result,
                                 prediction_result, recurring)
 
-    return {
+    result = {
         "user_id": user_id,
         "transaction_count": int(len(period_df)),
         "total_transaction_count": int(len(df)),
@@ -876,3 +1004,41 @@ def analyse_user(
         "insights": [f"{c['title']}. {c['detail']}" for c in cards],
         "recommendations": [c["action"] for c in cards if c["action"]],
     }
+
+    save_analysis_record(user_id, days, result, db)
+    return result
+
+
+def save_analysis_record(user_id: int, days: int, result: dict, db: Session) -> None:
+    """
+    Keep a record of each analysis run (analysis_results table), so results can
+    be compared over time. A failure here never stops the analysis being returned.
+    """
+    preds = result["spending_prediction"].get("predictions") or []
+    try:
+        db.execute(
+            text(
+                """
+                INSERT INTO analysis_results (
+                    user_id, period_days, transaction_count, total_spend_kes,
+                    anomaly_count, next_week_forecast_kes, result
+                )
+                VALUES (
+                    :user_id, :period_days, :transaction_count, :total_spend_kes,
+                    :anomaly_count, :next_week_forecast_kes, CAST(:result AS JSONB)
+                )
+                """
+            ),
+            {
+                "user_id": user_id,
+                "period_days": days,
+                "transaction_count": result["transaction_count"],
+                "total_spend_kes": result["period"]["total_spend_kes"],
+                "anomaly_count": result["anomaly_detection"]["anomaly_count"],
+                "next_week_forecast_kes": preds[0].get("predicted_spend_kes") if preds else None,
+                "result": json.dumps(result, default=str),
+            },
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
