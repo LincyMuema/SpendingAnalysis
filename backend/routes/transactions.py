@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from pydantic import BaseModel, Field
 from typing import Optional
+from datetime import datetime, timedelta, timezone
 from database import get_db
 from security import get_current_user_id, require_same_user
 
@@ -27,6 +28,7 @@ class TransactionRequest(BaseModel):
     user_id          : Optional[int] = None   # ignored; the user comes from the login token
     amount           : float = Field(gt=0)
     date             : str
+    occurred_at      : Optional[datetime] = None  # date and time of the payment, if known
     transaction_type : Optional[str] = None
     source           : Optional[str] = None
     counterparty     : Optional[str] = None
@@ -37,6 +39,15 @@ class TransactionRequest(BaseModel):
 class CategoryUpdateRequest(BaseModel):
     category_name : str
     apply_to_all  : Optional[bool] = False
+
+def _naive(value: Optional[datetime]) -> Optional[datetime]:
+    """
+    Store times as Kenyan local time without a time zone (the column is
+    TIMESTAMP). A time sent with a zone is converted to Nairobi time (UTC+3).
+    """
+    if value is None or value.tzinfo is None:
+        return value
+    return (value.astimezone(timezone.utc) + timedelta(hours=3)).replace(tzinfo=None)
 
 def get_or_create_category(category_name: str, user_id: int, db: Session) -> int:
     """
@@ -108,6 +119,16 @@ def create_transaction(
             {"user_id": request.user_id, "reference": request.reference}
         ).fetchone()
         if existing:
+            # Older imports were saved without a time: add it now
+            if request.occurred_at:
+                db.execute(
+                    text("""
+                        UPDATE transactions SET occurred_at = :occurred_at
+                        WHERE transaction_id = :id AND occurred_at IS NULL
+                    """),
+                    {"occurred_at": _naive(request.occurred_at), "id": existing[0]}
+                )
+                db.commit()
             return JSONResponse(
                 status_code=status.HTTP_200_OK,
                 content={
@@ -138,6 +159,7 @@ def create_transaction(
                 user_id,
                 amount,
                 date,
+                occurred_at,
                 transaction_type,
                 source,
                 counterparty,
@@ -149,6 +171,7 @@ def create_transaction(
                 :user_id,
                 :amount,
                 :date,
+                :occurred_at,
                 :transaction_type,
                 :source,
                 :counterparty,
@@ -162,6 +185,7 @@ def create_transaction(
             "user_id"          : request.user_id,
             "amount"           : request.amount,
             "date"             : request.date,
+            "occurred_at"      : _naive(request.occurred_at),
             "transaction_type" : request.transaction_type,
             "source"           : request.source,
             "counterparty"     : request.counterparty,
@@ -212,6 +236,7 @@ def get_transactions(
                 t.transaction_id,
                 t.amount,
                 t.date,
+                t.occurred_at,
                 t.transaction_type,
                 t.source,
                 t.counterparty,
@@ -222,7 +247,7 @@ def get_transactions(
             FROM transactions t
             LEFT JOIN categories c ON t.category_id = c.category_id
             WHERE t.user_id = :user_id
-            ORDER BY t.date DESC, t.transaction_id DESC
+            ORDER BY t.date DESC, t.occurred_at DESC NULLS LAST, t.transaction_id DESC
         """),
         {"user_id": user_id}
     ).fetchall()
@@ -235,6 +260,7 @@ def get_transactions(
                 "transaction_id"  : t.transaction_id,
                 "amount"          : t.amount,
                 "date"            : str(t.date),
+                "occurred_at"     : t.occurred_at.isoformat() if t.occurred_at else None,
                 "transaction_type": t.transaction_type,
                 "source"          : t.source,
                 "counterparty"    : t.counterparty,

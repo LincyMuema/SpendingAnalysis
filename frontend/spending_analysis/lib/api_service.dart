@@ -218,6 +218,7 @@ class ApiService {
     String categoryName = 'Other',
     bool isManual = true,
     String? reference,
+    DateTime? occurredAt, // date and time of the payment, if known
   }) async {
     final response = await http.post(
       Uri.parse('$_baseUrl/transactions/'),
@@ -232,6 +233,8 @@ class ApiService {
         'category_name': categoryName,
         'is_manual': isManual,
         'reference': reference,
+        // Local phone time, e.g. 2026-11-06T14:22:00.000 (no time zone)
+        'occurred_at': occurredAt?.toIso8601String(),
       }),
     );
     // 201 = saved, 200 = duplicate SMS ignored by the backend

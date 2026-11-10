@@ -66,6 +66,12 @@ class _AnalysisScreenState extends State<AnalysisScreen>
     }
   }
 
+  String _fmt(double v) {
+    if (v >= 1000000) return 'KSh ${(v / 1000000).toStringAsFixed(1)}M';
+    if (v >= 1000) return 'KSh ${(v / 1000).toStringAsFixed(1)}k';
+    return 'KSh ${v.toStringAsFixed(0)}';
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -651,6 +657,7 @@ class _ClustersTabState extends State<_ClustersTab> {
           final high = numOf(c, 'typical_high_kes');
           final avg = numOf(c, 'avg_amount_kes');
           final day = c['busiest_day'] as String?;
+          final time = c['typical_time'] as String?;
           final source = c['main_source'] as String?;
           final cats = List<Map<String, dynamic>>.from(
               (c['top_categories'] as List?)?.map((e) => Map<String, dynamic>.from(e as Map)) ??
@@ -666,6 +673,7 @@ class _ClustersTabState extends State<_ClustersTab> {
                 ? 'usually ${fmt(low)}–${fmt(high)}'
                 : 'about ${fmt(avg)} each',
             if (day != null) 'most often on ${day}s',
+            if (time != null) time,
             if (source != null) 'mostly by $source',
           ];
           final summary = '${parts.join(', ')}.';
@@ -917,7 +925,10 @@ class _AnomaliesTabState extends State<_AnomaliesTab> {
             final id = a['transaction_id'] as int? ?? -1;
             final amount = (a['amount'] as num?)?.toDouble() ?? 0;
             final date = a['date'] as String? ?? '';
+            final time = a['time'] as String?;
             final category = a['category'] as String? ?? 'Other';
+            final payee = a['counterparty'] as String?;
+            final reasons = List<String>.from(a['reasons'] ?? const []);
             final source = a['source'] as String? ?? '';
             final score = (a['anomaly_score'] as num?)?.toDouble() ?? 0;
             // Score is negative: more negative = more unusual
@@ -964,7 +975,12 @@ class _AnomaliesTabState extends State<_AnomaliesTab> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text(category,
+                            Text(
+                                payee != null && payee.isNotEmpty
+                                    ? '$payee · $category'
+                                    : category,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
                                 style: const TextStyle(
                                     color: Color(0xFF1A1A2E),
                                     fontWeight: FontWeight.w600,
@@ -972,7 +988,7 @@ class _AnomaliesTabState extends State<_AnomaliesTab> {
                             const SizedBox(height: 4),
                             Row(
                               children: [
-                                Text(date,
+                                Text(time != null ? '$date, $time' : date,
                                     style: const TextStyle(
                                         color: Colors.black45, fontSize: 12)),
                                 if (source.isNotEmpty) ...[
@@ -1013,6 +1029,28 @@ class _AnomaliesTabState extends State<_AnomaliesTab> {
                       ),
                     ],
                   ),
+                  // Why it was flagged, in plain words
+                  if (reasons.isNotEmpty) ...[
+                    const SizedBox(height: 10),
+                    ...reasons.map((r) => Padding(
+                          padding: const EdgeInsets.only(bottom: 4),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Icon(Icons.info_outline,
+                                  size: 14, color: sevColor),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(r,
+                                    style: const TextStyle(
+                                        color: Colors.black54,
+                                        fontSize: 12,
+                                        height: 1.3)),
+                              ),
+                            ],
+                          ),
+                        )),
+                  ],
                   Align(
                     alignment: Alignment.centerRight,
                     child: TextButton.icon(

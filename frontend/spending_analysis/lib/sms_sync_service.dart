@@ -126,6 +126,13 @@ class SmsSyncService {
       // fingerprint of the message text so a rescan never duplicates it.
       final reference = p.reference.isNotEmpty ? p.reference : _bankRef(body);
 
+      // The time the SMS arrived is used as the payment time, but only when
+      // the message is about a payment on that same day (not, for example,
+      // a statement listing older payments).
+      final received = m.date;
+      final occurredAt =
+          (received != null && _isoDay(received) == p.date) ? received : null;
+
       try {
         final res = await ApiService.createTransaction(
           userId: userId,
@@ -136,6 +143,7 @@ class SmsSyncService {
           categoryName: p.category,
           isManual: false,
           reference: reference,
+          occurredAt: occurredAt,
         );
         consecutiveFailures = 0;
         if (res['duplicate'] == true) {
@@ -174,6 +182,9 @@ class SmsSyncService {
 
   /// True if the user has already allowed SMS access (does not prompt).
   static Future<bool> hasPermission() => Permission.sms.isGranted;
+
+  static String _isoDay(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
   /// Stable 16-hex-digit fingerprint of the message text (fits VARCHAR(30)).
   static String _bankRef(String body) {

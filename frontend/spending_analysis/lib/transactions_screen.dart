@@ -3,9 +3,6 @@ import 'api_service.dart';
 import 'sms_sync_service.dart';
 import 'app_events.dart';
 
-// Standard categories shown in the pickers. These match the names in the
-// database categories table exactly. The user's own categories are added
-// to these at run time (see _loadCategories).
 const List<String> kCategories = [
   'Food & Dining',
   'Transport',
@@ -657,10 +654,17 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
               error = null;
             });
             try {
+              // A payment added for today gets the current time; for an
+              // earlier day the exact time is not known, so none is sent.
+              final now = DateTime.now();
+              final isToday = date.year == now.year &&
+                  date.month == now.month &&
+                  date.day == now.day;
               await ApiService.createTransaction(
                 userId: widget.userId,
                 amount: amount,
                 date: _apiDate(date),
+                occurredAt: isToday ? now : null,
                 source: source,
                 counterparty:
                     descCtrl.text.trim().isEmpty ? null : descCtrl.text.trim(),
