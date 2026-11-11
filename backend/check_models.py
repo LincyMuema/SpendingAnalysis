@@ -6,8 +6,8 @@ expected = {
     "kmeans_model": 12,             # 10 behaviour features + hour_sin, hour_cos
     "scaler_clustering": 12,
     "isolation_forest_model": 15,   # 8 behaviour features + 7 time features
-    "random_forest_model": 8,
-    "scaler_prediction": 8,
+    "random_forest_model": 12,      # 8 weekly features + 4 long-run features
+    "scaler_prediction": 12,
 }
 
 with warnings.catch_warnings(record=True) as caught:
@@ -19,7 +19,7 @@ with warnings.catch_warnings(record=True) as caught:
     rf = joblib.load("models/random_forest_model.pkl")
     print(f"\nRandom Forest: {rf.n_estimators} trees, min leaf {rf.min_samples_leaf}")
     km = joblib.load("models/kmeans_model.pkl")
-    print(f"K-Means: {km.n_clusters} clusters (should be 5)")
+    print(f"K-Means: {km.n_clusters} clusters")
 
 version_warnings = [w for w in caught if "Version" in type(w.message).__name__]
 print(f"\nVersion warnings: {len(version_warnings)}")
