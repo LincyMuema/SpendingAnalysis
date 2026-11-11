@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'register_screen.dart';
 import 'api_service.dart';
 import 'home_screen.dart';
+import 'forgot_password_screen.dart';
+import 'verify_login_screen.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -31,6 +33,21 @@ class _LoginScreenState extends State<LoginScreen> {
         rememberMe: _remember,
       );
       if (!mounted) return;
+      // Two-step sign-in: the password was right, now the emailed code is needed
+      if (result['two_factor_required'] == true) {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => VerifyLoginScreen(
+              email: _emailController.text.trim(),
+              password: _passwordController.text,
+              rememberMe: _remember,
+              emailHint: result['email_hint'] as String?,
+            ),
+          ),
+        );
+        return;
+      }
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(
@@ -48,6 +65,22 @@ class _LoginScreenState extends State<LoginScreen> {
       );
     } finally {
       if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _forgotPassword() async {
+    final email = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ForgotPasswordScreen(initialEmail: _emailController.text.trim()),
+      ),
+    );
+    // After a successful reset, fill in the email so the user can sign in
+    if (email != null && mounted) {
+      setState(() {
+        _emailController.text = email;
+        _passwordController.clear();
+      });
     }
   }
 
@@ -125,7 +158,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   const Text('Password',
                       style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: Colors.black87)),
                   GestureDetector(
-                    onTap: () {},
+                    onTap: _forgotPassword,
                     child: const Text('Forgot password?',
                         style: TextStyle(color: Color(0xFF5B2EFF), fontSize: 13, fontWeight: FontWeight.w500)),
                   ),

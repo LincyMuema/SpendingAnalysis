@@ -1085,8 +1085,79 @@ class _ForecastTab extends StatelessWidget {
 
   static const _purple = Color(0xFF5B2EFF);
   static const _orange = Color(0xFFFF9800);
+  static const _pink = Color(0xFFE91E63);
+  static const _red = Color(0xFFE53935);
+  static const _green = Color(0xFF4CAF50);
+  static const _months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                          'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  static const _weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
   double _num(dynamic v) => (v as num?)?.toDouble() ?? 0;
+  String _day(DateTime d) => '${d.day} ${_months[d.month - 1]}';
+
+  /// The coming 4 weeks. The model forecasts the total for the 4 weeks;
+  /// regular payments (rent, subscriptions...) are placed in the week they are
+  /// due, and the rest of the forecast (everyday spending) is spread evenly.
+  List<_ComingWeek> _comingWeeks(DateTime start, double total) {
+    final weeks = List.generate(4, (i) {
+      final s = start.add(Duration(days: 7 * i));
+      return _ComingWeek(start: s, end: s.add(const Duration(days: 6)));
+    });
+    final windowEnd = weeks.last.end;
+
+    final rec = Map<String, dynamic>.from(data['recurring_payments'] ?? {});
+    for (final raw in (rec['payments'] as List? ?? [])) {
+      final r = Map<String, dynamic>.from(raw as Map);
+      if (r['status'] == 'may_have_stopped') continue;
+      final next = DateTime.tryParse(r['next_expected_date'] as String? ?? '');
+      if (next == null) continue;
+      DateTime due = next;
+      final amount = _num(r['usual_amount_kes']);
+      final name = r['name'] as String? ?? '';
+      final freq = (r['frequency'] as String? ?? '').toLowerCase();
+      // Every expected payment that falls inside the 4 weeks
+      while (!due.isAfter(windowEnd)) {
+        if (!due.isBefore(start)) {
+          for (final w in weeks) {
+            if (!due.isAfter(w.end)) {
+              w.regular.add((name: name, amount: amount, due: due));
+              break;
+            }
+          }
+        }
+        if (freq.startsWith('weekly')) {
+          due = due.add(const Duration(days: 7));
+        } else if (freq.contains('2 weeks')) {
+          due = due.add(const Duration(days: 14));
+        } else {
+          due = DateTime(due.year, due.month + 1, due.day);
+        }
+      }
+    }
+
+    final regularTotal = weeks.fold<double>(0, (s, w) => s + w.regularTotal);
+    final everyday = ((total - regularTotal) / 4).clamp(0.0, double.infinity);
+    for (final w in weeks) {
+      w.everyday = everyday;
+    }
+    return weeks;
+  }
+
+  Widget _card({required Widget child, Color? borderColor}) => Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          border: borderColor != null ? Border.all(color: borderColor, width: 1.5) : null,
+          boxShadow: [
+            BoxShadow(
+                color: Colors.black.withOpacity(0.04),
+                blurRadius: 8,
+                offset: const Offset(0, 2))
+          ],
+        ),
+        child: child,
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -1094,57 +1165,62 @@ class _ForecastTab extends StatelessWidget {
         Map<String, dynamic>.from(data['spending_prediction'] ?? {});
     final status = prediction['status'] as String? ?? '';
     final forecast = Map<String, dynamic>.from(prediction['forecast'] ?? {});
-    final recent =
-        List<Map<String, dynamic>>.from(prediction['recent_weeks'] ?? []);
-    final usual = _num(prediction['average_weekly_spend_kes']);
-    final weeksHistory = prediction['weeks_of_history'] as int? ?? 0;
+    final avgWeekly = _num(prediction['average_weekly_spend_kes']);
+    final start = DateTime.tryParse(forecast['start_date'] as String? ?? '');
 
-    if (status != 'ok' || forecast.isEmpty) {
+    if (status != 'ok' || forecast.isEmpty || start == null) {
       final msg = prediction['message'] as String? ??
           'Not enough weekly history yet to make a forecast.';
       return _EmptyState(
         icon: Icons.timeline_outlined,
         message: msg,
         subtext:
-            'Record transactions across at least 4 complete weeks to unlock your forecast.',
+            'Record transactions across at least 4 weeks to unlock spending forecasts.',
       );
     }
 
-    final weekly = _num(forecast['weekly_avg_kes']);
     final total = _num(forecast['total_kes']);
-    final low = _num(forecast['low_kes']);
-    final high = _num(forecast['high_kes']);
+    final perWeek = _num(forecast['weekly_avg_kes']);
+    final low = _num(forecast['low_kes']) * 4;
+    final high = _num(forecast['high_kes']) * 4;
     final change = _num(forecast['change_vs_usual_pct']);
-    final label = forecast['label'] as String? ?? 'Next 4 weeks';
+    final usualTotal = avgWeekly * 4;
 
-    final compare = change > 10
-        ? '${change.toStringAsFixed(0)}% above your usual ${fmt(usual)} a week'
-        : change < -10
-            ? '${change.abs().toStringAsFixed(0)}% below your usual ${fmt(usual)} a week'
-            : 'In line with your usual ${fmt(usual)} a week';
-    final compareColor = change > 10
-        ? const Color(0xFFE53935)
-        : change < -10
-            ? const Color(0xFF4CAF50)
-            : Colors.black45;
+    final weeks = _comingWeeks(start, total);
+    final bills = [for (final w in weeks) ...w.regular]
+      ..sort((a, b) => a.due.compareTo(b.due));
+    final billsTotal = bills.fold<double>(0, (s, b) => s + b.amount);
+
+    final today = DateTime.now();
+    final todayDate = DateTime(today.year, today.month, today.day);
+    String weekLabel(_ComingWeek w) =>
+        !todayDate.isBefore(w.start) && !todayDate.isAfter(w.end)
+            ? 'This week'
+            : _day(w.start);
+
+    // How this compares with a usual 4 weeks, in plain words
+    final (String compareText, Color compareColor, IconData compareIcon) = change >= 5
+        ? ('${change.toStringAsFixed(0)}% more than your usual ${fmt(usualTotal)}',
+            change > 10 ? _red : Colors.black54, Icons.trending_up_rounded)
+        : change <= -5
+            ? ('${change.abs().toStringAsFixed(0)}% less than your usual ${fmt(usualTotal)}',
+                change < -10 ? _green : Colors.black54, Icons.trending_down_rounded)
+            : ('About the same as your usual ${fmt(usualTotal)}',
+                Colors.black54, Icons.trending_flat_rounded);
+
+    // Bars: scale so both the tallest week and the average line fit
+    final maxBar = weeks.map((w) => w.total).reduce((a, b) => a > b ? a : b);
+    final scaleMax = maxBar > avgWeekly ? maxBar : avgWeekly;
+    const barArea = 110.0;
+    final avgLineY = scaleMax > 0 ? (avgWeekly / scaleMax) * barArea : 0.0;
+    double h(double v) => scaleMax > 0 ? v / scaleMax * barArea : 0.0;
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
       children: [
-        // Main forecast
-        Container(
-          padding: const EdgeInsets.all(18),
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: _purple.withOpacity(0.35), width: 1.5),
-            boxShadow: [
-              BoxShadow(
-                  color: Colors.black.withOpacity(0.04),
-                  blurRadius: 8,
-                  offset: const Offset(0, 2))
-            ],
-          ),
+        // ── 1. The answer: what the next 4 weeks will probably cost ──────────
+        _card(
+          borderColor: _purple.withOpacity(0.35),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -1152,328 +1228,279 @@ class _ForecastTab extends StatelessWidget {
                 children: [
                   const Icon(Icons.psychology_outlined, color: _purple, size: 18),
                   const SizedBox(width: 6),
-                  Text('Next 4 weeks · $label',
+                  Text('Next 4 weeks  •  ${_day(weeks.first.start)} – ${_day(weeks.last.end)}',
                       style: const TextStyle(
-                          color: Colors.black54,
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600)),
+                          color: Colors.black54, fontSize: 12, fontWeight: FontWeight.w600)),
                 ],
               ),
               const SizedBox(height: 10),
-              Text('About ${fmt(weekly)} a week',
+              Text('About ${fmt(total)}',
                   style: const TextStyle(
-                      color: Color(0xFF1A1A2E),
-                      fontSize: 22,
-                      fontWeight: FontWeight.bold)),
-              const SizedBox(height: 4),
-              Text('Roughly ${fmt(total)} over the 4 weeks',
+                      color: Color(0xFF1A1A2E), fontSize: 26, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 2),
+              Text('roughly ${fmt(perWeek)} a week',
                   style: const TextStyle(color: Colors.black54, fontSize: 13)),
-              const SizedBox(height: 10),
-              Text(compare,
-                  style: TextStyle(
-                      color: compareColor,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600)),
-              const SizedBox(height: 14),
-              _RangeBar(low: low, high: high, value: weekly, usual: usual, fmt: fmt),
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: compareColor.withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(compareIcon, size: 16, color: compareColor),
+                    const SizedBox(width: 6),
+                    Flexible(
+                      child: Text(compareText,
+                          style: TextStyle(
+                              color: compareColor, fontSize: 12, fontWeight: FontWeight.w600)),
+                    ),
+                  ],
+                ),
+              ),
+              if (low > 0 && high > 0) ...[
+                const SizedBox(height: 10),
+                Text('Most likely between ${fmt(low)} and ${fmt(high)}',
+                    style: const TextStyle(color: Colors.black45, fontSize: 12)),
+              ],
             ],
           ),
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 20),
 
-        Row(
-          children: [
-            Expanded(
-              child: _SummaryCard(
-                icon: Icons.history,
-                label: 'Weeks of History',
-                value: '$weeksHistory weeks',
-                color: _purple,
+        // ── 2. Week by week ─────────────────────────────────────────────────
+        _SectionHeader(
+          icon: Icons.bar_chart_rounded,
+          label: 'Week by Week',
+          color: _purple,
+        ),
+        const SizedBox(height: 10),
+        _card(
+          child: Column(
+            children: [
+              SizedBox(
+                height: barArea + 22,
+                child: Stack(
+                  children: [
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: weeks.map((w) {
+                        return Expanded(
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.end,
+                              children: [
+                                Text(fmt(w.total),
+                                    style: const TextStyle(
+                                        color: Color(0xFF1A1A2E),
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.w600),
+                                    textAlign: TextAlign.center),
+                                const SizedBox(height: 6),
+                                ClipRRect(
+                                  borderRadius: BorderRadius.circular(6),
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      if (w.regularTotal > 0)
+                                        Container(height: h(w.regularTotal), color: _pink),
+                                      Container(
+                                          height: h(w.everyday).clamp(4.0, barArea),
+                                          color: _purple.withOpacity(0.75)),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                    if (avgWeekly > 0)
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: avgLineY - 1,
+                        child: const _DashedLine(color: _orange),
+                      ),
+                  ],
+                ),
               ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _SummaryCard(
-                icon: Icons.show_chart,
-                label: 'Usual Weekly Spend',
-                value: fmt(usual),
-                color: const Color(0xFF00BCD4),
+              const SizedBox(height: 8),
+              Row(
+                children: weeks
+                    .map((w) => Expanded(
+                          child: Text(weekLabel(w),
+                              style: const TextStyle(color: Colors.black45, fontSize: 10),
+                              textAlign: TextAlign.center),
+                        ))
+                    .toList(),
               ),
-            ),
-          ],
+              const SizedBox(height: 14),
+              const Divider(height: 1, color: Colors.black12),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 14,
+                runSpacing: 6,
+                children: [
+                  _legend(Container(
+                      width: 10, height: 10,
+                      decoration: BoxDecoration(
+                          color: _purple.withOpacity(0.75),
+                          borderRadius: BorderRadius.circular(2))),
+                      'Everyday spending'),
+                  if (bills.isNotEmpty)
+                    _legend(Container(
+                        width: 10, height: 10,
+                        decoration: BoxDecoration(
+                            color: _pink, borderRadius: BorderRadius.circular(2))),
+                        'Bills due'),
+                  if (avgWeekly > 0)
+                    _legend(const SizedBox(width: 16, child: _DashedLine(color: _orange)),
+                        'Your usual week (${fmt(avgWeekly)})'),
+                ],
+              ),
+            ],
+          ),
         ),
         const SizedBox(height: 20),
 
-        if (recent.isNotEmpty) ...[
+        // ── 3. Bills coming up ──────────────────────────────────────────────
+        if (bills.isNotEmpty) ...[
           _SectionHeader(
-            icon: Icons.bar_chart_rounded,
-            label: 'Recent Weeks and Forecast',
-            color: _purple,
+            icon: Icons.event_outlined,
+            label: 'Bills Coming Up',
+            color: _pink,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '${fmt(billsTotal)} of the forecast is regular payments you have made before.',
+            style: const TextStyle(color: Colors.black45, fontSize: 12, height: 1.4),
           ),
           const SizedBox(height: 10),
-          _RecentWeeksChart(
-              recent: recent, forecast: weekly, usual: usual, fmt: fmt),
-          const SizedBox(height: 16),
+          _card(
+            child: Column(
+              children: bills.asMap().entries.map((e) {
+                final b = e.value;
+                final daysAway = b.due.difference(todayDate).inDays;
+                final when = daysAway < 0
+                    ? 'Was due ${_day(b.due)}'
+                    : daysAway == 0
+                        ? 'Due today'
+                        : daysAway == 1
+                            ? 'Due tomorrow'
+                            : 'Due ${_weekdays[b.due.weekday - 1]} ${_day(b.due)}';
+                return Column(
+                  children: [
+                    if (e.key > 0) const Divider(height: 18, color: Colors.black12),
+                    Row(
+                      children: [
+                        Container(
+                          width: 36,
+                          height: 36,
+                          decoration: BoxDecoration(
+                            color: _pink.withOpacity(0.1),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: const Icon(Icons.autorenew_rounded, color: _pink, size: 18),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(b.name,
+                                  style: const TextStyle(
+                                      color: Color(0xFF1A1A2E),
+                                      fontWeight: FontWeight.w600,
+                                      fontSize: 13)),
+                              const SizedBox(height: 2),
+                              Text(when,
+                                  style: TextStyle(
+                                      color: daysAway <= 3 ? _orange : Colors.black45,
+                                      fontSize: 11,
+                                      fontWeight: daysAway <= 3
+                                          ? FontWeight.w600
+                                          : FontWeight.normal)),
+                            ],
+                          ),
+                        ),
+                        Text(fmt(b.amount),
+                            style: const TextStyle(
+                                color: Color(0xFF1A1A2E),
+                                fontWeight: FontWeight.bold,
+                                fontSize: 14)),
+                      ],
+                    ),
+                  ],
+                );
+              }).toList(),
+            ),
+          ),
+          const SizedBox(height: 20),
         ],
 
+        // ── 4. What to do with it ───────────────────────────────────────────
         Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
             color: _purple.withOpacity(0.05),
             borderRadius: BorderRadius.circular(12),
           ),
-          child: const Text(
-            'Why a 4-week average? Single weeks swing a lot when rent or a large '
-            'purchase falls in them, so Pesight forecasts your average weekly '
-            'spending over the coming month, which is far more reliable. The '
-            'range shows where most months end up.',
-            style: TextStyle(color: Colors.black54, fontSize: 12, height: 1.45),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Icon(Icons.tips_and_updates_outlined, size: 18, color: _purple),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  change > 10
+                      ? 'The coming weeks look more expensive than usual. Set aside ${fmt(total)} '
+                          'and check whether any large expenses can wait.'
+                      : bills.isNotEmpty
+                          ? 'Set aside ${fmt(billsTotal)} for the bills above, and keep everyday '
+                              'spending to about ${fmt(weeks.first.everyday)} a week.'
+                          : 'Aim to keep spending to about ${fmt(perWeek)} a week to stay on track.',
+                  style: const TextStyle(color: Color(0xFF1A1A2E), fontSize: 12.5, height: 1.45),
+                ),
+              ),
+            ],
           ),
         ),
         const SizedBox(height: 12),
         const Text(
-          '* Predicted with Random Forest Regression from your weekly history. '
-          'Forecasts are estimates and may not reflect planned or unusual expenses.',
+          '* The 4-week total is predicted with Random Forest Regression from your spending history. '
+          'Bills are placed in the week they are due and everyday spending is spread evenly. '
+          'Forecasts are estimates and may not include unplanned expenses.',
           style: TextStyle(color: Colors.black26, fontSize: 11, height: 1.4),
         ),
       ],
     );
   }
-}
 
-/// The likely range for the coming weeks, with the forecast and the usual week marked.
-class _RangeBar extends StatelessWidget {
-  final double low, high, value, usual;
-  final String Function(double) fmt;
-  const _RangeBar(
-      {required this.low,
-      required this.high,
-      required this.value,
-      required this.usual,
-      required this.fmt});
-
-  @override
-  Widget build(BuildContext context) {
-    final minV = [low, usual].reduce((a, b) => a < b ? a : b) * 0.9;
-    final maxV = [high, usual].reduce((a, b) => a > b ? a : b) * 1.1;
-    double pos(double v) =>
-        maxV > minV ? ((v - minV) / (maxV - minV)).clamp(0.0, 1.0) : 0.5;
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text('Usually between ${fmt(low)} and ${fmt(high)} a week',
-            style: const TextStyle(color: Colors.black45, fontSize: 12)),
-        const SizedBox(height: 10),
-        LayoutBuilder(builder: (context, c) {
-          final w = c.maxWidth;
-          return SizedBox(
-            height: 22,
-            child: Stack(
-              clipBehavior: Clip.none,
-              children: [
-                Positioned(
-                  left: 0, right: 0, top: 8,
-                  child: Container(
-                    height: 6,
-                    decoration: BoxDecoration(
-                        color: Colors.black12,
-                        borderRadius: BorderRadius.circular(3)),
-                  ),
-                ),
-                Positioned(
-                  left: pos(low) * w,
-                  width: (pos(high) - pos(low)) * w,
-                  top: 8,
-                  child: Container(
-                    height: 6,
-                    decoration: BoxDecoration(
-                        color: _ForecastTab._purple.withOpacity(0.35),
-                        borderRadius: BorderRadius.circular(3)),
-                  ),
-                ),
-                if (usual > 0)
-                  Positioned(
-                    left: pos(usual) * w - 1,
-                    top: 2,
-                    child: Container(width: 2, height: 18, color: _ForecastTab._orange),
-                  ),
-                Positioned(
-                  left: pos(value) * w - 7,
-                  top: 4,
-                  child: Container(
-                    width: 14, height: 14,
-                    decoration: BoxDecoration(
-                      color: _ForecastTab._purple,
-                      shape: BoxShape.circle,
-                      border: Border.all(color: Colors.white, width: 2),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          );
-        }),
-        const SizedBox(height: 8),
-        Row(
-          children: [
-            Container(
-                width: 10, height: 10,
-                decoration: const BoxDecoration(
-                    color: _ForecastTab._purple, shape: BoxShape.circle)),
-            const SizedBox(width: 6),
-            const Text('Forecast',
-                style: TextStyle(fontSize: 11, color: Colors.black45)),
-            const SizedBox(width: 16),
-            Container(width: 2, height: 12, color: _ForecastTab._orange),
-            const SizedBox(width: 6),
-            const Text('Your usual week',
-                style: TextStyle(fontSize: 11, color: Colors.black45)),
-          ],
-        ),
-      ],
-    );
-  }
-}
-
-/// Bars for the last few complete weeks, then one bar for the forecast
-/// weekly average, with the usual weekly spend drawn across them.
-class _RecentWeeksChart extends StatelessWidget {
-  final List<Map<String, dynamic>> recent;
-  final double forecast, usual;
-  final String Function(double) fmt;
-  const _RecentWeeksChart(
-      {required this.recent,
-      required this.forecast,
-      required this.usual,
-      required this.fmt});
-
-  @override
-  Widget build(BuildContext context) {
-    final values = recent
-        .map((w) => (w['spend_kes'] as num?)?.toDouble() ?? 0)
-        .toList();
-    final scaleMax = [...values, forecast, usual].reduce((a, b) => a > b ? a : b);
-    const barArea = 120.0;
-    double h(double v) =>
-        scaleMax > 0 ? (v / scaleMax * barArea).clamp(4.0, barArea) : 4.0;
-    final usualY = scaleMax > 0 ? usual / scaleMax * barArea : 0.0;
-
-    Widget bar(double v, Color color, {bool showValue = false}) => Expanded(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 3),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                if (showValue) ...[
-                  Text(fmt(v),
-                      style: const TextStyle(
-                          color: Color(0xFF1A1A2E),
-                          fontSize: 10,
-                          fontWeight: FontWeight.w600)),
-                  const SizedBox(height: 4),
-                ],
-                Container(
-                  height: h(v),
-                  decoration: BoxDecoration(
-                      color: color, borderRadius: BorderRadius.circular(5)),
-                ),
-              ],
-            ),
-          ),
-        );
-
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-              color: Colors.black.withOpacity(0.04),
-              blurRadius: 8,
-              offset: const Offset(0, 2))
-        ],
-      ),
-      child: Column(
+  Widget _legend(Widget swatch, String text) => Row(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          SizedBox(
-            height: barArea + 18,
-            child: Stack(
-              children: [
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    ...values.map((v) => bar(v, Colors.black.withOpacity(0.12))),
-                    bar(forecast, _ForecastTab._purple, showValue: true),
-                  ],
-                ),
-                if (usual > 0)
-                  Positioned(
-                    left: 0, right: 0, bottom: usualY - 1,
-                    child: const _DashedLine(color: _ForecastTab._orange),
-                  ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 6),
-          Row(
-            children: [
-              ...recent.map((w) => Expanded(
-                    child: Text(w['label'] as String? ?? '',
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(color: Colors.black38, fontSize: 9)),
-                  )),
-              const Expanded(
-                child: Text('Next 4',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                        color: _ForecastTab._purple,
-                        fontSize: 9,
-                        fontWeight: FontWeight.w600)),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          const Divider(height: 1, color: Colors.black12),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              Container(
-                  width: 10, height: 10,
-                  decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.12),
-                      borderRadius: BorderRadius.circular(2))),
-              const SizedBox(width: 6),
-              const Text('Spent (week starting)',
-                  style: TextStyle(fontSize: 11, color: Colors.black45)),
-              const SizedBox(width: 14),
-              Container(
-                  width: 10, height: 10,
-                  decoration: BoxDecoration(
-                      color: _ForecastTab._purple,
-                      borderRadius: BorderRadius.circular(2))),
-              const SizedBox(width: 6),
-              const Text('Forecast a week',
-                  style: TextStyle(fontSize: 11, color: Colors.black45)),
-            ],
-          ),
-          if (usual > 0) ...[
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                const SizedBox(
-                    width: 18, child: _DashedLine(color: _ForecastTab._orange)),
-                const SizedBox(width: 6),
-                Text('Your usual week: ${fmt(usual)}',
-                    style: const TextStyle(fontSize: 11, color: Colors.black45)),
-              ],
-            ),
-          ],
+          swatch,
+          const SizedBox(width: 6),
+          Text(text, style: const TextStyle(fontSize: 11, color: Colors.black45)),
         ],
-      ),
-    );
-  }
+      );
+}
+
+/// One of the coming weeks in the forecast.
+class _ComingWeek {
+  final DateTime start;
+  final DateTime end;
+  double everyday = 0;
+  final List<({String name, double amount, DateTime due})> regular = [];
+  _ComingWeek({required this.start, required this.end});
+
+  double get regularTotal => regular.fold<double>(0, (s, r) => s + r.amount);
+  double get total => everyday + regularTotal;
 }
 
 // ── Shared helper widgets ────────────────────────────────────────────────────
