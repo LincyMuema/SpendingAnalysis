@@ -28,6 +28,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
   late String _email = widget.email ?? '';
   String _phone = '';
   String? _memberSince;
+  bool _twoFactor = false;
+  bool _savingTwoFactor = false;
 
   @override
   void initState() {
@@ -74,6 +76,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     _email = (p['email'] as String?) ?? _email;
     _phone = (p['phone'] as String?) ?? '';
     _memberSince = p['member_since'] as String?;
+    _twoFactor = p['two_factor_enabled'] == true;
     AppEvents.fullName.value = _name;
   }
 
@@ -96,6 +99,59 @@ class _ProfileScreenState extends State<ProfileScreen> {
       context,
       MaterialPageRoute(builder: (_) => const ChangePasswordScreen()),
     );
+  }
+
+  /// Turning two-step sign-in on or off needs the current password.
+  Future<void> _toggleTwoFactor(bool enable) async {
+    final passwordController = TextEditingController();
+    final password = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(enable ? 'Turn on two-step sign-in' : 'Turn off two-step sign-in'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              enable
+                  ? 'Each time you sign in, we will email a 6-digit code to $_email that you enter after your password.'
+                  : 'You will sign in with your password only.',
+              style: const TextStyle(fontSize: 13, color: Colors.black54, height: 1.4),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: passwordController,
+              obscureText: true,
+              autofocus: true,
+              decoration: const InputDecoration(labelText: 'Your password'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, passwordController.text),
+            child: const Text('Confirm', style: TextStyle(color: Color(0xFF5B2EFF))),
+          ),
+        ],
+      ),
+    );
+    if (password == null || password.isEmpty || !mounted) return;
+
+    setState(() => _savingTwoFactor = true);
+    try {
+      final on = await ApiService.setTwoFactor(enabled: enable, password: password);
+      if (!mounted) return;
+      setState(() => _twoFactor = on);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(on ? 'Two-step sign-in is on' : 'Two-step sign-in is off')));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.toString().replaceAll('Exception: ', ''))));
+    } finally {
+      if (mounted) setState(() => _savingTwoFactor = false);
+    }
   }
 
   String get _memberSinceLabel {
@@ -317,6 +373,45 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     label: 'Change password',
                     subtitle: 'Requires your current password',
                     onTap: _changePassword,
+                  ),
+                  const Divider(height: 1, color: Colors.black12),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.verified_user_outlined,
+                            color: Color(0xFF5B2EFF), size: 22),
+                        const SizedBox(width: 12),
+                        const Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text('Two-step sign-in',
+                                  style: TextStyle(
+                                      color: Color(0xFF1A1A2E),
+                                      fontWeight: FontWeight.w600,
+                                      fontSize: 14)),
+                              SizedBox(height: 2),
+                              Text('Email a code each time you sign in',
+                                  style: TextStyle(color: Colors.black45, fontSize: 12)),
+                            ],
+                          ),
+                        ),
+                        _savingTwoFactor
+                            ? const Padding(
+                                padding: EdgeInsets.all(12),
+                                child: SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child: CircularProgressIndicator(strokeWidth: 2)),
+                              )
+                            : Switch(
+                                value: _twoFactor,
+                                activeColor: const Color(0xFF5B2EFF),
+                                onChanged: _toggleTwoFactor,
+                              ),
+                      ],
+                    ),
                   ),
                 ],
               ),

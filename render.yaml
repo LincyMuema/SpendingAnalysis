@@ -21,6 +21,12 @@ services:
         value: HS256
       - key: ACCESS_TOKEN_EXPIRE_MINUTES
         value: "60"
+      # Email codes (password reset, two-step sign-in) are sent through Brevo.
+      # sync: false = the value is typed into Render's Environment tab, never stored here.
+      - key: BREVO_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
 
 databases:
   - name: pesight-db

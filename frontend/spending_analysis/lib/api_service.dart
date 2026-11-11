@@ -149,6 +149,9 @@ class ApiService {
   }
 
   // ── Login ───────────────────────────────────────────────────────────────────
+  /// Returns the user (user_id, full_name, token). If two-step sign-in is on,
+  /// returns {'two_factor_required': true, 'email_hint': ...} instead and a
+  /// code is emailed; finish with [verifyLogin].
   static Future<Map<String, dynamic>> login({
     required String email,
     required String password,
@@ -165,19 +168,77 @@ class ApiService {
     );
     final data = _decode(response);
     if (response.statusCode == 200) {
-      AppEvents.fullName.value = null;
-      _token = data['token'];
-      if (rememberMe) {
-        try {
-          await _saveSession(data, email);
-        } catch (_) {} // still logged in for this session
-      } else {
-        await logout();
-        _token = data['token'];
-      }
+      if (data['two_factor_required'] == true) return data;
+      await _completeLogin(data, email, rememberMe);
       return data; // has: message, user_id, full_name, token
     }
     throw Exception(data['detail'] ?? 'Login failed');
+  }
+
+  /// Second step of two-step sign-in: the 6-digit code from the email.
+  static Future<Map<String, dynamic>> verifyLogin({
+    required String email,
+    required String code,
+    bool rememberMe = false,
+  }) async {
+    final response = await http.post(
+      Uri.parse('$_baseUrl/authentication/verify-login'),
+      headers: _headers,
+      body: jsonEncode({'email': email, 'code': code, 'remember_me': rememberMe}),
+    );
+    final data = _decode(response);
+    if (response.statusCode == 200) {
+      await _completeLogin(data, email, rememberMe);
+      return data;
+    }
+    throw Exception(data['detail'] ?? 'Verification failed');
+  }
+
+  static Future<void> _completeLogin(
+      Map<String, dynamic> data, String email, bool rememberMe) async {
+    AppEvents.fullName.value = null;
+    if (rememberMe) {
+      _token = data['token'];
+      try {
+        await _saveSession(data, email);
+      } catch (_) {} // still logged in for this session
+    } else {
+      await logout(); // forget any previously remembered account
+      _token = data['token'];
+    }
+  }
+
+  // ── Password reset ─────────────────────────────────────────────────────────
+  /// Emails a 6-digit reset code (the reply is the same whether or not the
+  /// email has an account).
+  static Future<String> forgotPassword({required String email}) async {
+    final response = await http.post(
+      Uri.parse('$_baseUrl/authentication/forgot-password'),
+      headers: _headers,
+      body: jsonEncode({'email': email}),
+    );
+    final data = _decode(response);
+    if (response.statusCode == 200) {
+      return data['message'] as String? ?? 'Check your email for a code';
+    }
+    throw Exception(data['detail'] ?? 'Could not send the code');
+  }
+
+  static Future<String> resetPassword({
+    required String email,
+    required String code,
+    required String newPassword,
+  }) async {
+    final response = await http.post(
+      Uri.parse('$_baseUrl/authentication/reset-password'),
+      headers: _headers,
+      body: jsonEncode({'email': email, 'code': code, 'new_password': newPassword}),
+    );
+    final data = _decode(response);
+    if (response.statusCode == 200) {
+      return data['message'] as String? ?? 'Password reset';
+    }
+    throw Exception(data['detail'] ?? 'Could not reset the password');
   }
 
   // ── Get Transactions ────────────────────────────────────────────────────────
@@ -350,5 +411,19 @@ class ApiService {
       }),
     );
     _check(response, 'Failed to change password');
+  }
+
+  /// Turns two-step sign-in on or off (needs the current password).
+  static Future<bool> setTwoFactor({
+    required bool enabled,
+    required String password,
+  }) async {
+    final response = await http.put(
+      Uri.parse('$_baseUrl/authentication/two-factor'),
+      headers: _headers,
+      body: jsonEncode({'enabled': enabled, 'password': password}),
+    );
+    final data = _check(response, 'Failed to update two-step sign-in');
+    return data['two_factor_enabled'] == true;
   }
 }
