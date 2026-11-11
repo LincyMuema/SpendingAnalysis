@@ -211,11 +211,11 @@ class _HomeBodyState extends State<_HomeBody> {
     }
 
     final prediction = Map<String, dynamic>.from(a['spending_prediction'] ?? {});
-    final preds = List<Map<String, dynamic>>.from(prediction['predictions'] ?? []);
-    if (prediction['status'] == 'ok' && preds.isNotEmpty) {
-      final next = (preds.first['predicted_spend_kes'] as num).toDouble();
+    final forecast = Map<String, dynamic>.from(prediction['forecast'] ?? {});
+    if (prediction['status'] == 'ok' && forecast.isNotEmpty) {
+      final next = (forecast['weekly_avg_kes'] as num).toDouble();
       final avg = (prediction['average_weekly_spend_kes'] as num?)?.toDouble() ?? 0;
-      final diff = avg > 0 ? (next - avg) / avg * 100 : 0.0;
+      final diff = (forecast['change_vs_usual_pct'] as num?)?.toDouble() ?? 0.0;
       final compare = diff > 10
           ? '${diff.toStringAsFixed(0)}% above your usual ${_fmt(avg)}'
           : diff < -10
@@ -224,8 +224,8 @@ class _HomeBodyState extends State<_HomeBody> {
       return _HighlightCard(
         icon: Icons.trending_up_rounded,
         color: const Color(0xFF5B2EFF),
-        title: 'Next week: about ${_fmt(next)}',
-        subtitle: '$compare. Tap for the 4-week forecast.',
+        title: 'Next 4 weeks: about ${_fmt(next)} a week',
+        subtitle: '$compare. Tap for the forecast.',
         onTap: () => AppEvents.openAnalysis(AnalysisTabs.forecast),
       );
     }

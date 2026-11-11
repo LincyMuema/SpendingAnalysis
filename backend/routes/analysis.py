@@ -73,6 +73,11 @@ MAX_GAP_MINUTES = 10080         # one week; longer gaps (and the first payment) 
 # time of a payment is not known
 UNKNOWN_LOG_MINS = 6.83
 
+# Forecast range shown in the app ("usually between ... and ..."): on the test
+# weeks, 80% of actual results fell between these multiples of the forecast.
+# From the training notebook (cell 13): 80% of test forecasts fell inside it.
+FORECAST_RANGE = (0.73, 1.26)
+
 SOURCE_MAP = {
     "CARD": 0,
     "CASH": 1,
@@ -244,10 +249,33 @@ def add_transaction_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_weekly_features(df: pd.DataFrame) -> pd.DataFrame:
+def add_weekly_features(weekly: pd.DataFrame) -> pd.DataFrame:
     """
-    Aggregate expense transactions into weekly rows.
-    The current Random Forest model expects these eight features.
+    Forecast inputs for each week. Every feature uses only that week and
+    earlier weeks. Must match add_weekly_features in the preprocessing notebook.
+    """
+    s = weekly["total_spend"]
+    weekly["4week_avg"] = s.rolling(4, min_periods=1).mean().shift(1).fillna(0.0)
+    weekly["4week_max"] = s.rolling(4, min_periods=1).max().shift(1).fillna(0.0)
+    weekly["spend_vs_avg"] = (
+        s / weekly["4week_avg"].replace(0, np.nan)
+    ).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    weekly["week_of_month_num"] = weekly["week"].apply(
+        lambda period: (period.start_time.day - 1) // 7 + 1
+    )
+    weekly["12week_avg"] = s.rolling(12, min_periods=1).mean()
+    weekly["long_mean"] = s.expanding().mean()        # the user's usual level
+    weekly["long_median"] = s.expanding().median()
+    weekly["long_std"] = s.expanding().std().fillna(0.0)
+    return weekly
+
+
+def build_weekly_features(df: pd.DataFrame, today=None) -> pd.DataFrame:
+    """
+    One row per calendar week, from the first week with spending to the last
+    complete week. Weeks with no spending are included as 0, as in training.
+    The current week is left out while it is still in progress, because a
+    part-week would look like a week of low spending.
     """
     df = df.copy()
     df["week"] = df["date"].dt.to_period("W")
@@ -260,37 +288,18 @@ def build_weekly_features(df: pd.DataFrame) -> pd.DataFrame:
             avg_transaction=("amount", "mean"),
             max_transaction=("amount", "max"),
         )
-        .reset_index()
-        .sort_values("week")
-        .reset_index(drop=True)
     )
+    if weekly.empty:
+        return weekly.reset_index()
 
-    # Historical features are shifted so the current week is not included
-    # in its own historical average or maximum.
-    weekly["4week_avg"] = (
-        weekly["total_spend"]
-        .rolling(4, min_periods=1)
-        .mean()
-        .shift(1)
-        .fillna(0.0)
-    )
-    weekly["4week_max"] = (
-        weekly["total_spend"]
-        .rolling(4, min_periods=1)
-        .max()
-        .shift(1)
-        .fillna(0.0)
-    )
+    full = pd.period_range(weekly.index.min(), weekly.index.max(), freq=weekly.index.freq)
+    weekly = weekly.reindex(full).fillna(0.0).rename_axis("week").reset_index()
 
-    weekly["spend_vs_avg"] = (
-        weekly["total_spend"] / weekly["4week_avg"].replace(0, np.nan)
-    ).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    today = pd.Timestamp(today or datetime.now().date())
+    if weekly["week"].iloc[-1].end_time.normalize() >= today:
+        weekly = weekly.iloc[:-1].reset_index(drop=True)
 
-    weekly["week_of_month_num"] = weekly["week"].apply(
-        lambda period: (period.start_time.day - 1) // 7 + 1
-    )
-
-    return weekly
+    return add_weekly_features(weekly)
 
 
 # ── K-Means spending pattern analysis ───────────────────────────────────────
@@ -628,16 +637,16 @@ def run_anomaly_detection(df: pd.DataFrame) -> dict:
 
 # ── Random Forest weekly spending prediction ────────────────────────────────
 
-def run_prediction(df: pd.DataFrame) -> dict:
+def run_prediction(df: pd.DataFrame, today=None) -> dict:
     """
-    Predict weekly spending for the next four weeks.
-
-    IMPORTANT: This function assumes the Random Forest was trained using the
-    same eight features and feature order listed below.
+    Forecast the user's average weekly spending over the next four weeks.
+    A single week is too unpredictable (one rent payment or large purchase
+    changes it a lot), so the model forecasts the 4-week average instead.
     """
     rf_model = models["random_forest_model"]
     scaler = models["scaler_prediction"]
 
+    # Must match features_prediction in the training notebook (same order)
     prediction_features = [
         "total_spend",
         "transaction_count",
@@ -647,71 +656,61 @@ def run_prediction(df: pd.DataFrame) -> dict:
         "4week_max",
         "spend_vs_avg",
         "week_of_month_num",
+        "12week_avg",
+        "long_mean",
+        "long_median",
+        "long_std",
     ]
 
-    weekly = build_weekly_features(df)
+    weekly = build_weekly_features(df, today)
 
     if len(weekly) < 4:
         return {
             "status": "insufficient_data",
-            "message": "At least 4 weeks of transactions are needed for predictions.",
+            "message": "At least 4 complete weeks of transactions are needed for a forecast.",
             "predictions": [],
         }
 
-    # Forecast from the end of the last recorded week.
-    history = weekly["total_spend"].astype(float).tolist()
-    last_week_start = weekly["week"].iloc[-1].start_time
-    last_observed = weekly.iloc[-1]
+    last = weekly.iloc[-1]
+    x = scaler.transform(last[prediction_features].to_frame().T.astype(float).values)
+    weekly_avg = max(0.0, float(rf_model.predict(x)[0]))
 
-    predictions = []
+    # The 4 weeks after the last complete week
+    start = last["week"].start_time + timedelta(weeks=1)
+    end = start + timedelta(weeks=4) - timedelta(days=1)
+    usual = float(last["long_mean"])
 
-    for i in range(1, 5):
-        previous_four = history[-4:]
-        historical_average = float(np.mean(previous_four))
-        historical_maximum = float(np.max(previous_four))
-
-        next_week_start = last_week_start + timedelta(weeks=i)
-
-        # For future rows, the target-week transaction count/average/max are
-        # not known. Use the most recent observed values as estimates.
-        feature_row = {
-            "total_spend": history[-1],
-            "transaction_count": float(last_observed["transaction_count"]),
-            "avg_transaction": float(last_observed["avg_transaction"]),
-            "max_transaction": float(last_observed["max_transaction"]),
-            "4week_avg": historical_average,
-            "4week_max": historical_maximum,
-            "spend_vs_avg": (
-                history[-1] / historical_average
-                if historical_average > 0 else 1.0
-            ),
-            "week_of_month_num": (next_week_start.day - 1) // 7 + 1,
-        }
-
-        x_future = pd.DataFrame(
-            [feature_row], columns=prediction_features
-        ).values
-        x_scaled = scaler.transform(x_future)
-        predicted_spend = max(0.0, float(rf_model.predict(x_scaled)[0]))
-
-        predictions.append(
-            {
-                "week_label": next_week_start.strftime("Week of %d %b %Y"),
-                "predicted_spend_kes": round(predicted_spend, 2),
-            }
-        )
-
-        # Use this prediction as history for the following forecast.
-        history.append(predicted_spend)
-
+    recent = weekly.tail(8)
     return {
         "status": "ok",
         "model_used": "Random Forest Regression",
         "weeks_of_history": int(len(weekly)),
-        "average_weekly_spend_kes": round(
-            float(weekly["total_spend"].mean()), 2
-        ),
-        "predictions": predictions,
+        "average_weekly_spend_kes": round(usual, 2),
+        "forecast": {
+            "start_date": str(start.date()),
+            "end_date": str(end.date()),
+            "label": f"{start.day} {start:%b} – {end.day} {end:%b}",
+            "weekly_avg_kes": round(weekly_avg, 2),
+            "total_kes": round(weekly_avg * 4, 2),
+            "low_kes": round(weekly_avg * FORECAST_RANGE[0], 2),
+            "high_kes": round(weekly_avg * FORECAST_RANGE[1], 2),
+            "change_vs_usual_pct": round((weekly_avg - usual) / usual * 100, 1) if usual > 0 else 0.0,
+        },
+        "recent_weeks": [
+            {
+                "week_start": str(r["week"].start_time.date()),
+                "label": f"{r['week'].start_time.day} {r['week'].start_time:%b}",
+                "spend_kes": round(float(r["total_spend"]), 2),
+            }
+            for _, r in recent.iterrows()
+        ],
+        # Kept for the analysis record and older app versions
+        "predictions": [
+            {
+                "week_label": "Next 4 weeks (weekly average)",
+                "predicted_spend_kes": round(weekly_avg, 2),
+            }
+        ],
     }
 
 
@@ -864,24 +863,27 @@ def build_insight_cards(
              "Cancel any subscriptions you no longer use.", "recurring")
 
     # Forecast
-    if prediction_result.get("status") == "ok" and prediction_result.get("predictions"):
-        nxt = float(prediction_result["predictions"][0]["predicted_spend_kes"])
+    if prediction_result.get("status") == "ok" and prediction_result.get("forecast"):
+        fc = prediction_result["forecast"]
+        nxt = float(fc["weekly_avg_kes"])
         avg = float(prediction_result["average_weekly_spend_kes"])
-        change = (nxt - avg) / avg * 100 if avg > 0 else 0
+        change = float(fc["change_vs_usual_pct"])
         if change > 10:
-            card(90, "forecast", f"Next week may cost more: about {_ksh(nxt)}",
-                 f"That is {change:.0f}% above your usual {_ksh(avg)} a week.",
+            card(90, "forecast", f"The next 4 weeks may cost more: about {_ksh(nxt)} a week",
+                 f"That is {change:.0f}% above your usual {_ksh(avg)} a week "
+                 f"(about {_ksh(fc['total_kes'])} in total).",
                  "Check for large planned expenses and where you could cut back.", "forecast")
         elif change < -10:
-            card(45, "forecast", f"Next week looks lighter: about {_ksh(nxt)}",
+            card(45, "forecast", f"The next 4 weeks look lighter: about {_ksh(nxt)} a week",
                  f"That is {abs(change):.0f}% below your usual {_ksh(avg)} a week.",
                  None, "forecast")
         else:
-            card(40, "forecast", f"Next week: about {_ksh(nxt)}",
-                 f"In line with your usual {_ksh(avg)} a week.", None, "forecast")
+            card(40, "forecast", f"Next 4 weeks: about {_ksh(nxt)} a week",
+                 f"In line with your usual {_ksh(avg)} a week "
+                 f"(about {_ksh(fc['total_kes'])} in total).", None, "forecast")
     else:
         card(20, "info", "Forecast not available yet",
-             "At least 4 weeks of transactions are needed to predict your spending.",
+             "At least 4 complete weeks of transactions are needed to forecast your spending.",
              "Keep recording transactions; the forecast appears automatically.", "forecast")
 
     # Categories in the selected period
