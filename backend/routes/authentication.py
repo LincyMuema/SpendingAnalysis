@@ -5,6 +5,10 @@ POST /authentication/login    - authenticate and return a token
 GET  /authentication/me       - the logged-in user's profile (also checks a saved token)
 PATCH /authentication/me      - update name, email or phone
 POST /authentication/change-password - change password (current password required)
+POST /authentication/forgot-password - email a code for resetting the password
+POST /authentication/reset-password  - set a new password using the emailed code
+POST /authentication/verify-login    - finish signing in with the emailed code (two-step sign-in)
+PUT  /authentication/two-factor      - turn two-step sign-in on or off (password required)
 
 The token is sent by the app with every other request
 (Authorization: Bearer <token>) and checked in security.py.
@@ -13,12 +17,17 @@ The token is sent by the app with every other request
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+import hashlib
+import hmac
+import os
 import re
+import secrets
 from typing import Optional
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from database import get_db
 from security import create_token, get_current_user_id
+from email_service import send_code_email
 
 router = APIRouter()
 
@@ -47,15 +56,137 @@ class ChangePasswordRequest(BaseModel):
 
 class AuthResponse(BaseModel):
     message   : str
-    user_id   : int
-    full_name : str
-    token     : str
+    user_id   : Optional[int] = None
+    full_name : Optional[str] = None
+    token     : Optional[str] = None
+    # Two-step sign-in: the password was right, but a code has been emailed
+    # and must be entered (POST /authentication/verify-login) to get the token
+    two_factor_required : bool = False
+    email_hint          : Optional[str] = None
+
+class ForgotPasswordRequest(BaseModel):
+    email : str
+
+class ResetPasswordRequest(BaseModel):
+    email        : str
+    code         : str
+    new_password : str
+
+class VerifyLoginRequest(BaseModel):
+    email       : str
+    code        : str
+    remember_me : bool = False
+
+class TwoFactorRequest(BaseModel):
+    enabled  : bool
+    password : str
 
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
-def verify_password(plain: str, hashed: str) -> bool:
+def verify_password(plain: str, hashed: Optional[str]) -> bool:
+    if not hashed:      # e.g. an account created with Google sign-in has no password
+        return False
     return pwd_context.verify(plain, hashed)
+
+
+# ── One-time email codes ────────────────────────────────────────────────────
+CODE_MINUTES = 10        # a code is valid for 10 minutes
+CODE_MAX_ATTEMPTS = 5    # wrong guesses allowed before a new code is needed
+CODE_RESEND_SECONDS = 60 # minimum time between two codes for the same purpose
+
+
+def _hash_code(code: str) -> str:
+    """Codes are stored hashed (keyed with the server's secret), never as plain text."""
+    key = (os.getenv("SECRET_KEY") or "").encode()
+    return hmac.new(key, code.encode(), hashlib.sha256).hexdigest()
+
+
+def _mask_email(email: str) -> str:
+    """jane.doe@gmail.com -> j*******@gmail.com"""
+    name, _, domain = email.partition("@")
+    return f"{name[:1]}{'*' * max(len(name) - 1, 1)}@{domain}"
+
+
+def _issue_code(db: Session, user, purpose: str) -> None:
+    """Create a new 6-digit code for this purpose and email it to the user."""
+    recent = db.execute(
+        text("""
+            SELECT 1 FROM auth_codes
+            WHERE user_id = :id AND purpose = :purpose
+              AND created_at > NOW() - make_interval(secs => :secs)
+        """),
+        {"id": user.user_id, "purpose": purpose, "secs": CODE_RESEND_SECONDS},
+    ).fetchone()
+    if recent:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="A code was sent less than a minute ago. Check your email, or wait a minute and try again.",
+        )
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    # Only the newest code for each purpose is kept
+    db.execute(text("DELETE FROM auth_codes WHERE user_id = :id AND purpose = :purpose"),
+               {"id": user.user_id, "purpose": purpose})
+    db.execute(
+        text("""
+            INSERT INTO auth_codes (user_id, purpose, code_hash, expires_at)
+            VALUES (:id, :purpose, :hash, NOW() + make_interval(mins => :mins))
+        """),
+        {"id": user.user_id, "purpose": purpose, "hash": _hash_code(code), "mins": CODE_MINUTES},
+    )
+    db.commit()
+
+    if not send_code_email(user.email, user.full_name, code, purpose, CODE_MINUTES):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="We could not send the email right now. Please try again in a few minutes.",
+        )
+
+
+def _check_code(db: Session, user_id: int, purpose: str, code: str) -> None:
+    """Accept the code (and delete it) or raise a clear error."""
+    row = db.execute(
+        text("""
+            SELECT code_id, code_hash, attempts, expires_at > NOW() AS valid
+            FROM auth_codes
+            WHERE user_id = :id AND purpose = :purpose
+            ORDER BY created_at DESC LIMIT 1
+        """),
+        {"id": user_id, "purpose": purpose},
+    ).fetchone()
+
+    if not row or not row.valid:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="This code has expired. Please request a new one.")
+    if row.attempts >= CODE_MAX_ATTEMPTS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Too many incorrect attempts. Please request a new code.")
+
+    if not hmac.compare_digest(row.code_hash, _hash_code(code.strip())):
+        db.execute(text("UPDATE auth_codes SET attempts = attempts + 1 WHERE code_id = :c"),
+                   {"c": row.code_id})
+        db.commit()
+        left = CODE_MAX_ATTEMPTS - row.attempts - 1
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Incorrect code. {left} attempt{'s' if left != 1 else ''} left." if left
+                   else "Incorrect code. Please request a new one.",
+        )
+
+    db.execute(text("DELETE FROM auth_codes WHERE user_id = :id AND purpose = :purpose"),
+               {"id": user_id, "purpose": purpose})
+    db.commit()
+
+
+def _user_by_email(db: Session, email: str):
+    return db.execute(
+        text("""
+            SELECT user_id, full_name, email, password_hash, two_factor_enabled
+            FROM users WHERE LOWER(email) = :email
+        """),
+        {"email": email.strip().lower()},
+    ).fetchone()
 
 def password_problems(password: str) -> list[str]:
     """List what a password is missing. An empty list means it is strong enough."""
@@ -135,19 +266,22 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     """
     request.email = request.email.strip().lower()
 
-    user = db.execute(
-        text("""
-            SELECT user_id, full_name, password_hash
-            FROM users
-            WHERE LOWER(email) = :email
-        """),
-        {"email": request.email}
-    ).fetchone()
+    user = _user_by_email(db, request.email)
 
     if not user or not verify_password(request.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password"
+        )
+
+    # Two-step sign-in: the password is right, now a code is emailed.
+    # The token is only given out by /verify-login once the code is entered.
+    if user.two_factor_enabled:
+        _issue_code(db, user, "login_2fa")
+        return AuthResponse(
+            message             = "Enter the code we emailed you",
+            two_factor_required = True,
+            email_hint          = _mask_email(user.email),
         )
 
     token = create_token(user.user_id, remember=request.remember_me)
@@ -164,7 +298,7 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
 def _profile(user_id: int, db: Session) -> dict:
     user = db.execute(
         text("""
-            SELECT user_id, full_name, email, phone, created_at
+            SELECT user_id, full_name, email, phone, created_at, two_factor_enabled
             FROM users WHERE user_id = :id
         """),
         {"id": user_id},
@@ -177,6 +311,7 @@ def _profile(user_id: int, db: Session) -> dict:
         "email"       : user.email,
         "phone"       : user.phone,
         "member_since": user.created_at.date().isoformat() if user.created_at else None,
+        "two_factor_enabled": bool(user.two_factor_enabled),
     }
 
 
@@ -272,3 +407,99 @@ def change_password(
     )
     db.commit()
     return {"message": "Password changed"}
+
+
+# Password reset ────────────────────────────────────────────────────────────
+
+# POST /authentication/forgot-password
+@router.post("/forgot-password")
+def forgot_password(request: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    """
+    Email a 6-digit code for resetting the password. The reply is the same
+    whether or not the email has an account, so the endpoint cannot be used
+    to find out who is registered.
+    """
+    reply = {"message": "If an account exists for this email, a reset code has been sent. It expires in "
+                        f"{CODE_MINUTES} minutes."}
+    user = _user_by_email(db, request.email)
+    if user:
+        try:
+            _issue_code(db, user, "password_reset")
+        except HTTPException as e:
+            if e.status_code != status.HTTP_429_TOO_MANY_REQUESTS:
+                raise
+            # A code was sent moments ago: give the same reply, so the
+            # endpoint still does not reveal whether the account exists
+    return reply
+
+
+# POST /authentication/reset-password
+@router.post("/reset-password")
+def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db)):
+    """Set a new password after checking the emailed code."""
+    user = _user_by_email(db, request.email)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="This code has expired. Please request a new one.")
+
+    missing = password_problems(request.new_password)
+    if missing:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="New password needs " + ", ".join(missing))
+
+    _check_code(db, user.user_id, "password_reset", request.code)
+
+    db.execute(
+        text("UPDATE users SET password_hash = :h WHERE user_id = :id"),
+        {"h": hash_password(request.new_password), "id": user.user_id},
+    )
+    db.commit()
+    return {"message": "Password reset. You can now sign in with your new password."}
+
+
+# Two-step sign-in ──────────────────────────────────────────────────────────
+
+# POST /authentication/verify-login
+@router.post("/verify-login", response_model=AuthResponse)
+def verify_login(request: VerifyLoginRequest, db: Session = Depends(get_db)):
+    """Second step of signing in: check the emailed code and return the token."""
+    user = _user_by_email(db, request.email)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="This code has expired. Please sign in again.")
+
+    _check_code(db, user.user_id, "login_2fa", request.code)
+
+    return AuthResponse(
+        message   = "Login successful",
+        user_id   = user.user_id,
+        full_name = user.full_name,
+        token     = create_token(user.user_id, remember=request.remember_me),
+    )
+
+
+# PUT /authentication/two-factor
+@router.put("/two-factor")
+def set_two_factor(
+    request: TwoFactorRequest,
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """Turn two-step sign-in on or off. The current password is required."""
+    user = db.execute(
+        text("SELECT password_hash FROM users WHERE user_id = :id"),
+        {"id": current_user_id},
+    ).fetchone()
+    if not user or not verify_password(request.password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Your password is incorrect")
+
+    db.execute(
+        text("UPDATE users SET two_factor_enabled = :on WHERE user_id = :id"),
+        {"on": request.enabled, "id": current_user_id},
+    )
+    db.commit()
+    return {
+        "message": "Two-step sign-in turned on" if request.enabled else "Two-step sign-in turned off",
+        "two_factor_enabled": request.enabled,
+    }
