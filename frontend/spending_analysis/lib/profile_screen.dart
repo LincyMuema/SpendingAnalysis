@@ -4,6 +4,7 @@ import 'app_events.dart';
 import 'edit_profile_screen.dart';
 import 'login_screen.dart';
 import 'sms_sync_service.dart';
+import 'verify_email_screen.dart';
 
 
 class ProfileScreen extends StatefulWidget {
@@ -29,6 +30,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
   String _phone = '';
   String? _memberSince;
   bool _twoFactor = false;
+  bool _emailVerified = true; // until the profile loads, do not show the reminder
+  bool _hasPassword = true;
   bool _savingTwoFactor = false;
 
   @override
@@ -77,6 +80,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
     _phone = (p['phone'] as String?) ?? '';
     _memberSince = p['member_since'] as String?;
     _twoFactor = p['two_factor_enabled'] == true;
+    _emailVerified = p['email_verified'] != false;
+    _hasPassword = p['has_password'] != false;
     AppEvents.fullName.value = _name;
   }
 
@@ -94,11 +99,22 @@ class _ProfileScreenState extends State<ProfileScreen> {
     );
   }
 
-  void _changePassword() {
-    Navigator.push(
+  Future<void> _changePassword() async {
+    final changed = await Navigator.push<bool>(
       context,
-      MaterialPageRoute(builder: (_) => const ChangePasswordScreen()),
+      MaterialPageRoute(builder: (_) => ChangePasswordScreen(hasPassword: _hasPassword)),
     );
+    if (changed == true && !_hasPassword && mounted) setState(() => _hasPassword = true);
+  }
+
+  Future<void> _verifyEmail() async {
+    final verified = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => VerifyEmailScreen(email: _email, sendOnOpen: true),
+      ),
+    );
+    if (verified == true && mounted) setState(() => _emailVerified = true);
   }
 
   /// Turning two-step sign-in on or off needs the current password.
@@ -356,6 +372,38 @@ class _ProfileScreenState extends State<ProfileScreen> {
             ),
             const SizedBox(height: 20),
 
+            // Reminder to confirm the email address (hidden once verified)
+            if (!_emailVerified) ...[
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFF9800).withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: const Color(0xFFFF9800).withOpacity(0.3)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.mark_email_unread_outlined,
+                        color: Color(0xFFFF9800), size: 24),
+                    const SizedBox(width: 12),
+                    const Expanded(
+                      child: Text(
+                        'Confirm your email so password-reset and sign-in codes reach you.',
+                        style: TextStyle(color: Color(0xFF1A1A2E), fontSize: 12.5, height: 1.4),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: _verifyEmail,
+                      child: const Text('Verify',
+                          style: TextStyle(
+                              color: Color(0xFF5B2EFF), fontWeight: FontWeight.w600)),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 20),
+            ],
+
             // Account
             const _SectionTitle('Account'),
             _Card(
@@ -370,8 +418,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   const Divider(height: 1, color: Colors.black12),
                   _ActionRow(
                     icon: Icons.lock_outline,
-                    label: 'Change password',
-                    subtitle: 'Requires your current password',
+                    label: _hasPassword ? 'Change password' : 'Set a password',
+                    subtitle: _hasPassword
+                        ? 'Requires your current password'
+                        : 'You sign in with Google; a password lets you sign in with email too',
                     onTap: _changePassword,
                   ),
                   const Divider(height: 1, color: Colors.black12),
