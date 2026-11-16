@@ -228,7 +228,7 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
       ownName: widget.ownName,
       sinceDays: 365,
     );
-    if (!mounted) return;
+    if (!mounted || result.cancelled) return;
     setState(() => _isSyncing = false);
 
     if (result.permissionDenied) {

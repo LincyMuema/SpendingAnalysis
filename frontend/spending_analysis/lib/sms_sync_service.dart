@@ -12,6 +12,7 @@ class SmsSyncResult {
   final int duplicates; // already in the database
   final int skipped; // income / transfers to yourself / too old
   final int failed; // could not be saved
+  final bool cancelled; // stopped because the user logged out
   final String? error;
 
   const SmsSyncResult({
@@ -22,6 +23,7 @@ class SmsSyncResult {
     this.duplicates = 0,
     this.skipped = 0,
     this.failed = 0,
+    this.cancelled = false,
     this.error,
   });
 
@@ -49,6 +51,8 @@ class SmsSyncService {
     'MPESA',        // Safaricom M-Pesa
     'AIRTELMONEY',  // Airtel Money
     'IANDMBANK',    // I&M Bank
+    'COOPBANK',     // Co-operative Bank
+    'ABSABANK',     // Absa Bank Kenya
   ];
 
   static bool isFinancialSender(String? address) {
@@ -97,8 +101,14 @@ class SmsSyncService {
 
     int imported = 0, duplicates = 0, skipped = 0, failed = 0;
     int consecutiveFailures = 0;
+    final session = ApiService.session;
 
     for (final m in messages) {
+      // The user logged out while the sync was running: stop quietly
+      if (ApiService.session != session || !ApiService.isLoggedIn) {
+        return const SmsSyncResult(cancelled: true);
+      }
+
       // Check the sender first: personal messages are never parsed
       if (!isFinancialSender(m.address)) continue;
 
@@ -152,6 +162,9 @@ class SmsSyncService {
           imported++;
         }
       } catch (_) {
+        if (ApiService.session != session || !ApiService.isLoggedIn) {
+          return const SmsSyncResult(cancelled: true);
+        }
         failed++;
         consecutiveFailures++;
         // Backend probably unreachable: stop instead of failing 100 times.

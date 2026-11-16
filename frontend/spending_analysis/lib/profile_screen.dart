@@ -195,7 +195,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
       ownName: _name,
       sinceDays: 365,
     );
-    if (!mounted) return;
+    if (!mounted || r.cancelled) return;
     setState(() => _syncing = false);
     if (r.imported > 0) AppEvents.notifyTransactionsChanged();
     await _load();
@@ -474,7 +474,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
               title: 'Your data and privacy',
               children: [
                   _Bullet('Transaction messages are processed on your phone. Only the amount, date, merchant and payment method are saved, never the full message text.'),
-                  _Bullet('Only messages from M-Pesa, Airtel Money and I&M Bank are read. Personal messages are skipped without being opened.'),
+                  _Bullet('Only messages from M-Pesa, Airtel Money, I&M Bank, Co-operative Bank and Absa are read. Personal messages are skipped without being opened.'),
                   _Bullet('Your password is stored encrypted (hashed), and every request to the server needs your login token.'),
               ],
             ),
