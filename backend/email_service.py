@@ -75,6 +75,10 @@ def send_code_email(to_email: str, to_name: str, code: str, purpose: str, minute
         subject = "Your Pesight password reset code"
         intro = "Use this code to reset your Pesight password:"
         outro = "If you did not ask to reset your password, you can ignore this email; your password has not changed."
+    elif purpose == "email_verify":
+        subject = "Confirm your Pesight email"
+        intro = "Welcome to Pesight! Use this code to confirm your email address:"
+        outro = "If you did not create a Pesight account, you can ignore this email."
     else:
         subject = "Your Pesight sign-in code"
         intro = "Use this code to finish signing in to Pesight:"
