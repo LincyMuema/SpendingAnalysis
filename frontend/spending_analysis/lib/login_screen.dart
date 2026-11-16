@@ -4,6 +4,7 @@ import 'api_service.dart';
 import 'home_screen.dart';
 import 'forgot_password_screen.dart';
 import 'verify_login_screen.dart';
+import 'google_button.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -250,34 +251,11 @@ class _LoginScreenState extends State<LoginScreen> {
               ),
               const SizedBox(height: 20),
 
-              // Or continue with
-              const Center(
-                child: Text('Or continue with',
-                    style: TextStyle(color: Colors.black38, fontSize: 13)),
-              ),
+              const OrDivider(),
               const SizedBox(height: 12),
-
-              OutlinedButton(
-                style: OutlinedButton.styleFrom(
-                  minimumSize: const Size(double.infinity, 48),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                  side: const BorderSide(color: Colors.black12),
-                  backgroundColor: Colors.white,
-                ),
+              GoogleButton(
+                label: 'Sign in with Google',
                 onPressed: _isLoading ? null : _handleGoogle,
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Container(
-                      width: 20, height: 20,
-                      decoration: const BoxDecoration(shape: BoxShape.circle, color: Color(0xFF4285F4)),
-                      child: const Icon(Icons.g_mobiledata, color: Colors.white, size: 16),
-                    ),
-                    const SizedBox(width: 8),
-                    const Text('Google',
-                        style: TextStyle(color: Colors.black87, fontWeight: FontWeight.w500)),
-                  ],
-                ),
               ),
               const SizedBox(height: 24),
 
