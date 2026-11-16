@@ -1,11 +1,23 @@
+-- PESIGHT: FULL DATABASE RESET (deletes EVERYTHING, then rebuilds the empty tables)
+--
+-- What it does:
+--   1. Deletes every table, including ALL user accounts and ALL transactions.
+--   2. Recreates the 6 tables, the indexes and the 17 standard categories.
+-- It adds no users or transactions. To add the demo account, run
+-- sample.sql afterwards.
+--
+-- How to run: pgAdmin -> the Render database -> a NEW, EMPTY query tab ->
+-- paste this whole file -> run with nothing highlighted.
 
 BEGIN;
 
+
 -- ── 1. Remove existing tables (children before parents) ─────────────────────
-DROP TABLE IF EXISTS recommendations  CASCADE;
+DROP TABLE IF EXISTS recommendations  CASCADE;   -- old reserved tables, no longer used
 DROP TABLE IF EXISTS predictions      CASCADE;
 DROP TABLE IF EXISTS alerts           CASCADE;
 DROP TABLE IF EXISTS analysis_results CASCADE;
+DROP TABLE IF EXISTS auth_codes       CASCADE;
 DROP TABLE IF EXISTS merchant_rules   CASCADE;
 DROP TABLE IF EXISTS transactions     CASCADE;
 DROP TABLE IF EXISTS categories       CASCADE;
@@ -19,7 +31,10 @@ CREATE TABLE users (
     full_name     VARCHAR(100) NOT NULL,
     email         VARCHAR(100) NOT NULL UNIQUE,
     phone         VARCHAR(20),
-    password_hash VARCHAR(255) NOT NULL,
+    password_hash VARCHAR(255),                 -- empty for Google-only accounts
+    google_id     VARCHAR(255) UNIQUE,          -- set when signed in with Google
+    two_factor_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    email_verified BOOLEAN NOT NULL DEFAULT FALSE,   -- TRUE once the emailed code is entered (or Google sign-in)
     created_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -41,6 +56,7 @@ CREATE TABLE transactions (
     user_id           INT          NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
     amount            FLOAT        NOT NULL CHECK (amount > 0),
     date              DATE         NOT NULL,
+    occurred_at       TIMESTAMP,                             -- time of the payment from the SMS, if known
     transaction_type  VARCHAR(20),
     source            VARCHAR(20)  CHECK (source IN ('MPESA', 'CARD', 'CASH', 'WALLET')),
     counterparty      VARCHAR(100),                          -- merchant or person paid
@@ -59,40 +75,30 @@ CREATE TABLE merchant_rules (
     PRIMARY KEY (user_id, counterparty)
 );
 
--- ── 3. Tables reserved for storing analysis output (not yet used) ─────────────
+-- ── 3. Sign-in codes and analysis records ───────────────────────────────────
 
+-- One-time codes for password reset and two-step sign-in (only hashes are stored).
+CREATE TABLE auth_codes (
+    code_id     SERIAL PRIMARY KEY,
+    user_id     INT          NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    purpose     VARCHAR(20)  NOT NULL CHECK (purpose IN ('password_reset', 'login_2fa', 'email_verify')),
+    code_hash   VARCHAR(255) NOT NULL,
+    expires_at  TIMESTAMP    NOT NULL,
+    attempts    INT          NOT NULL DEFAULT 0,
+    created_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- A record of every analysis run (summary columns plus the full result).
 CREATE TABLE analysis_results (
-    result_id   SERIAL PRIMARY KEY,
-    user_id     INT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    cluster_id  INT,
-    analysed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE alerts (
-    alert_id       SERIAL PRIMARY KEY,
-    user_id        INT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    transaction_id INT REFERENCES transactions(transaction_id) ON DELETE CASCADE,
-    message        TEXT,
-    severity       VARCHAR(20),
-    status         VARCHAR(20) NOT NULL DEFAULT 'unread',
-    created_at     TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE predictions (
-    prediction_id    SERIAL PRIMARY KEY,
-    user_id          INT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    predicted_amount FLOAT,
-    period           VARCHAR(20),
-    overspend_risk   VARCHAR(20),
-    created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE recommendations (
-    recommendation_id SERIAL PRIMARY KEY,
-    user_id           INT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    message           TEXT,
-    category          VARCHAR(50),
-    created_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    analysis_id            SERIAL PRIMARY KEY,
+    user_id                INT           NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    created_at             TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    period_days            INT           NOT NULL,
+    transaction_count      INT           NOT NULL,
+    total_spend_kes        NUMERIC(12,2) NOT NULL,
+    anomaly_count          INT           NOT NULL,
+    next_week_forecast_kes NUMERIC(12,2),             -- empty when there is not enough history
+    result                 JSONB         NOT NULL
 );
 
 -- ── 4. Indexes ───────────────────────────────────────────────────────────────
@@ -103,7 +109,10 @@ CREATE UNIQUE INDEX uq_transactions_user_reference
     WHERE reference IS NOT NULL;
 
 -- Speeds up loading a user's transactions newest-first.
-CREATE INDEX ix_transactions_user_date ON transactions (user_id, date DESC);
+CREATE INDEX ix_transactions_user_date ON transactions (user_id, date DESC, occurred_at DESC);
+
+CREATE INDEX ix_auth_codes_user_purpose ON auth_codes (user_id, purpose);
+CREATE INDEX ix_analysis_results_user_time ON analysis_results (user_id, created_at DESC);
 
 -- ── 5. Seed the 17 standard categories (order fixes their category_id) ──────
 INSERT INTO categories (name, icon) VALUES
@@ -127,8 +136,8 @@ INSERT INTO categories (name, icon) VALUES
 
 COMMIT;
 
--- ── 6. Check ─────────────────────────────────────────────────────────────────
+-- Check
 SELECT table_name FROM information_schema.tables
-WHERE table_schema = 'public' ORDER BY table_name;      -- expect 8 tables
+WHERE table_schema = 'public' ORDER BY table_name;      -- expect 6 tables
 
-SELECT category_id, name FROM categories ORDER BY category_id;   -- expect 17 rows
+SELECT COUNT(*) AS categories FROM categories;           -- expect 17

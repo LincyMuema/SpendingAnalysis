@@ -88,6 +88,34 @@ SOURCE_MAP = {
 
 # ── Encoding helpers ────────────────────────────────────────────────────────
 
+# Names that should stay in capitals when merchant names are tidied for display.
+_KEEP_UPPER = {
+    "KPLC", "KFC", "DSTV", "GOTV", "KRA", "NHIF", "NSSF", "SHA", "SHIF", "KCB",
+    "NCBA", "DTB", "ABSA", "JTL", "ATM", "POS", "CBD", "TV", "USA", "UK", "KE",
+    "II", "III", "ABC", "BP", "MPESA", "M-PESA",
+}
+_NOT_ACRONYMS = {"LTD", "LT", "MR", "MRS", "MS", "DR", "ST", "RD"}
+
+
+def _display_name(name) -> str:
+    """Tidy a merchant or payee name for display: "NAIVAS WESTLANDS" ->
+    "Naivas Westlands", but "KPLC PREPAID" -> "KPLC Prepaid" (str.title()
+    would give "Kplc Prepaid") and "MAMA'S KITCHEN" -> "Mama's Kitchen"."""
+    words = []
+    for w in str(name).split():
+        core = w.strip(".,()&-").upper()
+        if core in _KEEP_UPPER or (
+            2 <= len(core) <= 5 and core.isalpha()
+            and not any(c in "AEIOUY" for c in core) and core not in _NOT_ACRONYMS
+        ):
+            words.append(w.upper())             # acronym: KPLC, KFC, JTL
+        elif any(c.isdigit() for c in w):
+            words.append(w.upper())             # codes like "B2" or "4G"
+        else:
+            words.append("-".join(p[:1].upper() + p[1:].lower() for p in w.split("-")))
+    return " ".join(words)
+
+
 def encode_category(name: str) -> int:
     """Encode a category using the same codes as training."""
     name = str(name or "Other").strip()
@@ -457,7 +485,7 @@ def describe_clusters(featured_df: pd.DataFrame) -> dict:
         ]
 
         merchants = g.loc[g["counterparty"] != "", "counterparty"].value_counts().head(3)
-        top_merchants = [str(m).title() for m in merchants.index]
+        top_merchants = [_display_name(m) for m in merchants.index]
 
         median_amount = float(g["amount"].median())
         pct_weekend = float(g["is_weekend"].mean() * 100)
@@ -615,7 +643,7 @@ def run_anomaly_detection(df: pd.DataFrame) -> dict:
                 "date": str(row["date"].date()),
                 "time": _fmt_time(row),
                 "category": str(row["category_name"]),
-                "counterparty": str(row["counterparty"]).title() if row["counterparty"] else None,
+                "counterparty": _display_name(row["counterparty"]) if row["counterparty"] else None,
                 "reasons": _anomaly_reasons(row),
                 "source": str(row["source"]),
                 "anomaly_score": round(float(row["anomaly_score"]), 4),
@@ -778,7 +806,7 @@ def detect_recurring(df: pd.DataFrame) -> dict:
             status_ = "active"
 
         found.append({
-            "name": str(payee).title(),
+            "name": _display_name(payee),
             "category": str(g["category_name"].mode().iloc[0]),
             "frequency": label,
             "usual_amount_kes": round(usual, 2),
