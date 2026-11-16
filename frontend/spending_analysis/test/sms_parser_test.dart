@@ -76,6 +76,56 @@ void main() {
     });
   });
 
+  // Formats below come from real messages; names, references and account
+  // numbers have been replaced.
+  group('Co-operative Bank', () {
+    const sms =
+        'Please NEVER share your PIN, PASSWORD, any codes or CARD details with ANYONE! not even people who may claim to be bank staff. Ref:AC00000TEST1: Dear JANE, MPESA transfer of KES 1200 to MARY ANNE WANJIKU-2547 at 05-11-2026 04:24 PM was successful.MPESA Ref:TST0000C01.';
+
+    test('M-Pesa transfer from the bank account', () {
+      final r = SmsParser.parse(sms)!;
+      expect(r.reference, 'TST0000C01');
+      expect(r.amount, 1200);
+      expect(r.date, '2026-11-05');
+      expect(r.source, 'CARD');
+      expect(r.counterparty, 'MARY ANNE WANJIKU');
+      expect(r.isExpense, true);
+    });
+
+    test('transfer to your own M-Pesa is not an expense', () {
+      final r = SmsParser.parse(
+          'Ref:AC00000TEST2: Dear JANE, MPESA transfer of KES 100 to Jane Wambui Doe-2547 at 10-11-2026 09:40 AM was successful.MPESA Ref:TST0000C02.',
+          ownName: 'Jane Doe')!;
+      expect(r.isExpense, false);
+    });
+  });
+
+  group('Absa', () {
+    test('card debit, merchant from the fixed-width field', () {
+      final r = SmsParser.parse(
+          'Dear Customer a Debit has been made for KES3400 in Account ending XX0000 AT POS BALTIC TEXTILE TRADING LTNAIROBI      KE. please call 0700000000 for any enquiries',
+          today: DateTime(2026, 11, 8))!;
+      expect(r.amount, 3400);
+      expect(r.date, '2026-11-08'); // no date in the message: the day it arrived
+      expect(r.source, 'CARD');
+      expect(r.counterparty, 'BALTIC TEXTILE TRADING LT');
+      expect(r.category, 'Shopping');
+    });
+
+    test('fuel station', () {
+      final r = SmsParser.parse(
+          'Dear Customer a Debit has been made for KES3000 in Account ending XX0000 AT POS RUBIS LANGATA ROAD       NAIROBI      KE. please call 0700000000 for any enquiries')!;
+      expect(r.counterparty, 'RUBIS LANGATA ROAD');
+      expect(r.category, 'Transport');
+    });
+
+    test('credit is not an expense', () {
+      final r = SmsParser.parse(
+          'Dear Customer a Credit has been made for KES60000 on your Account XX0000 VIA Digital/Branch Banking please call 0700000000 for any enquiries')!;
+      expect(r.isExpense, false);
+    });
+  });
+
   group('Categories', () {
     test('person names are not mistaken for keywords', () {
       expect(SmsParser.categorise('SHARON WANJIKU'), 'Other');

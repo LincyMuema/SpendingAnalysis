@@ -31,8 +31,15 @@ class ApiService {
 
   static bool get isLoggedIn => _token != null;
 
+  /// Goes up by one at every logout. Long-running work (such as an SMS sync)
+  /// notes it when it starts and stops quietly if it changes, so it never
+  /// carries on sending requests for a user who has logged out.
+  static int _session = 0;
+  static int get session => _session;
+
   /// Clears the token from memory and from the phone.
   static Future<void> logout() async {
+    _session++;
     _token = null;
     AppEvents.fullName.value = null; // forget the previous user's name
     try {
@@ -111,6 +118,10 @@ class ApiService {
     if (ok.contains(response.statusCode)) return data;
 
     if (response.statusCode == 401) {
+      // Already logged out (e.g. a request that was still running when the
+      // user tapped Log out): nothing to clean up, and no second trip to the
+      // login screen.
+      if (_token == null) throw Exception('You are logged out.');
       logout();
       final nav = navigatorKey?.currentState;
       if (nav != null && loginScreenBuilder != null) {

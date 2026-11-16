@@ -1,4 +1,5 @@
-/// Parses M-Pesa, Airtel Money and bank (I&M) transaction SMS messages.
+/// Parses M-Pesa, Airtel Money and bank (I&M, Co-operative Bank, Absa)
+/// transaction SMS messages.
 ///
 /// Pure Dart: no Flutter or plugin dependencies, so it can be unit tested
 /// with `flutter test`.
@@ -6,8 +7,9 @@
 /// Formats verified against real messages: M-Pesa "paid to", Airtel Money
 /// "sent to", I&M Bank card purchase. M-Pesa "sent to", "received" and airtime
 /// formats are written from the standard Safaricom wording and have NOT yet
-/// been checked against real messages. Anything unrecognised returns null so
-/// the user can add it manually.
+/// been checked against real messages. Co-operative Bank M-Pesa transfers,
+/// Absa debit and credit alerts are checked against real messages. Anything unrecognised returns null so the user can
+/// add it manually.
 
 class ParsedSms {
   final String reference; // M-Pesa / Airtel code, '' for bank SMS
@@ -56,6 +58,22 @@ class SmsParser {
   static final _rAirtime = RegExp(_pAirtime, caseSensitive: false);
   static final _rAirtel = RegExp(_pAirtel, caseSensitive: false);
   static final _rBank = RegExp(_pBank, caseSensitive: false);
+
+  // Co-operative Bank: money sent from the bank account to an M-Pesa number
+  // "Ref:AC53...: Dear JANE, MPESA transfer of KES 1200 to JOHN DOE-2547 at
+  //  05-11-2026 04:24 PM was successful.MPESA Ref:UK5P915VW3."
+  static final _rCoopMpesa = RegExp(
+      r'MPESA transfer of KES\s*([\d,]+(?:\.\d+)?)\s+to\s+(.+?)\s+at\s+(\d{1,2}-\d{1,2}-\d{4})\s+\d{1,2}:\d{2}\s*[AP]M\s+was successful\.?\s*(?:MPESA Ref:\s*([A-Z0-9]+))?',
+      caseSensitive: false);
+
+  // Absa: card or account debit. The message has no date (the date the SMS
+  // arrived is used) and the merchant is a fixed-width card field:
+  // 25 characters of name, 13 of town, then the country code.
+  static final _rAbsaDebit = RegExp(
+      r'a Debit has been made for KES\s*([\d,]+(?:\.\d+)?)\s+in Account ending\s+\S+\s+AT\s+(.+?)\.?\s*please call',
+      caseSensitive: false);
+  static final _rAbsaCredit =
+      RegExp(r'a Credit has been made for KES\s*([\d,]+(?:\.\d+)?)', caseSensitive: false);
 
   // M-Pesa mini-statement: "[20260728; ;Customer Send Money; ...;Ksh30.00]Completed [...]"
   // It summarises the last 5 transactions, which already arrived as their own
@@ -138,6 +156,43 @@ class SmsParser {
           'WALLET', ownName);
     }
 
+    m = _rCoopMpesa.firstMatch(text);
+    if (m != null) {
+      final ref = m.group(4) ?? '';
+      final r = _person(ref, m.group(1)!, m.group(2)!,
+          m.group(3)!.replaceAll('-', '/'), 'CARD', ownName);
+      return r;
+    }
+
+    // Absa uses runs of spaces inside the merchant field, so it is read from
+    // the original message, not the space-collapsed copy.
+    final absaText = body.replaceAll(RegExp(r'[\r\n]+'), ' ');
+    m = _rAbsaDebit.firstMatch(absaText);
+    if (m != null) {
+      final merchant = _absaMerchant(m.group(2)!);
+      return ParsedSms(
+        reference: '',
+        amount: _amount(m.group(1)!),
+        date: _iso(today ?? DateTime.now()),
+        source: 'CARD',
+        counterparty: merchant,
+        category: categorise(merchant),
+        isExpense: true,
+      );
+    }
+    m = _rAbsaCredit.firstMatch(text);
+    if (m != null) {
+      return ParsedSms(
+        reference: '',
+        amount: _amount(m.group(1)!),
+        date: _iso(today ?? DateTime.now()),
+        source: 'CARD',
+        counterparty: 'Absa deposit',
+        category: 'Other',
+        isExpense: false, // money in
+      );
+    }
+
     m = _rBank.firstMatch(text);
     if (m != null) {
       final merchant = m.group(3)!.trim();
@@ -168,9 +223,7 @@ class SmsParser {
   static ParsedSms _person(String ref, String amt, String rawName, String dmy,
       String source, String? ownName) {
     final name = _cleanName(rawName);
-    final isOwn = ownName != null &&
-        ownName.trim().isNotEmpty &&
-        name.toUpperCase().contains(ownName.trim().toUpperCase());
+    final isOwn = _isOwnName(name, ownName);
     return ParsedSms(
       reference: ref,
       amount: _amount(amt),
@@ -225,10 +278,38 @@ class SmsParser {
     );
   }
 
+  /// True if [name] is the user's own name, e.g. a transfer to their own
+  /// M-Pesa. Every word of [ownName] must appear, so "Jane Doe" matches
+  /// "JANE WANJIRU DOE" but not "JANE SMITH".
+  static bool _isOwnName(String name, String? ownName) {
+    if (ownName == null || ownName.trim().isEmpty) return false;
+    final words = name.toUpperCase().split(RegExp(r'[^A-Z]+')).toSet();
+    final own = ownName
+        .toUpperCase()
+        .split(RegExp(r'[^A-Z]+'))
+        .where((w) => w.length >= 2)
+        .toList();
+    return own.isNotEmpty && own.every(words.contains);
+  }
+
+  /// Absa merchant field: "BALTIC TEXTILE TRADING LTNAIROBI      KE" ->
+  /// "BALTIC TEXTILE TRADING LT" (25 characters of name, then the town).
+  static String _absaMerchant(String raw) {
+    var field = raw.trim();
+    if (field.toUpperCase().startsWith('POS ')) field = field.substring(4);
+    // Fixed-width field as sent by the card network
+    if (field.length >= 27 && RegExp(r'\s[A-Z]{2}$').hasMatch(field)) {
+      return field.substring(0, 25).trim();
+    }
+    // Otherwise stop at the first run of spaces
+    return field.split(RegExp(r'\s{2,}')).first.trim();
+  }
+
   static double _amount(String s) => double.parse(s.replaceAll(',', ''));
 
   /// Removes a trailing phone number / masked number and trailing full stop.
   static String _cleanName(String s) => s
+      .replaceAll(RegExp(r'\s*-\s*[\dxX*]{3,}$'), '') // "JOHN DOE-2547..." (masked phone)
       .replaceAll(RegExp(r'\s+[\dxX*]{6,}$'), '')
       .replaceAll(RegExp(r'(?<=[A-Za-z])\d{5,}$'), '')
       .replaceAll(RegExp(r'\.+$'), '')
@@ -290,6 +371,7 @@ class SmsParser {
       'lc waikiki', 'decathlon', 'hotpoint', 'enterprises', 'traders',
       'wholesalers', 'wholesale', 'retail', 'electronics', 'hardware',
       'beauty', 'salon', 'cosmetics', 'pharmacy', 'chemist',
+      'textile', 'china square', 'clothing', 'fashion',
     ],
   };
 
