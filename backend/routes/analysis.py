@@ -700,7 +700,7 @@ def run_prediction(df: pd.DataFrame, today=None) -> dict:
         }
 
     last = weekly.iloc[-1]
-    x = scaler.transform(last[prediction_features].to_frame().T.astype(float).values)
+    x = scaler.transform(last[prediction_features].to_frame().T.astype(float))  # keep column names
     weekly_avg = max(0.0, float(rf_model.predict(x)[0]))
 
     # The 4 weeks after the last complete week
