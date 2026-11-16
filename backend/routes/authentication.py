@@ -9,6 +9,9 @@ POST /authentication/forgot-password - email a code for resetting the password
 POST /authentication/reset-password  - set a new password using the emailed code
 POST /authentication/verify-login    - finish signing in with the emailed code (two-step sign-in)
 PUT  /authentication/two-factor      - turn two-step sign-in on or off (password required)
+POST /authentication/send-verification - email a code to confirm the account's email address
+POST /authentication/verify-email    - confirm the email address with that code
+POST /authentication/google          - sign in (or sign up) with a Google account
 
 The token is sent by the app with every other request
 (Authorization: Bearer <token>) and checked in security.py.
@@ -28,6 +31,12 @@ from passlib.context import CryptContext
 from database import get_db
 from security import create_token, get_current_user_id
 from email_service import send_code_email
+
+# Google sign-in: the app sends the ID token Google gave it, and the backend
+# checks it with Google's public keys, so a Google login cannot be faked.
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
+from google.auth import exceptions as google_exceptions
 
 router = APIRouter()
 
@@ -63,6 +72,7 @@ class AuthResponse(BaseModel):
     # and must be entered (POST /authentication/verify-login) to get the token
     two_factor_required : bool = False
     email_hint          : Optional[str] = None
+    email               : Optional[str] = None   # returned by Google sign-in
 
 class ForgotPasswordRequest(BaseModel):
     email : str
@@ -80,6 +90,13 @@ class VerifyLoginRequest(BaseModel):
 class TwoFactorRequest(BaseModel):
     enabled  : bool
     password : str
+
+class VerifyEmailRequest(BaseModel):
+    code : str
+
+class GoogleSignInRequest(BaseModel):
+    id_token    : str
+    remember_me : bool = False
 
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
@@ -182,7 +199,8 @@ def _check_code(db: Session, user_id: int, purpose: str, code: str) -> None:
 def _user_by_email(db: Session, email: str):
     return db.execute(
         text("""
-            SELECT user_id, full_name, email, password_hash, two_factor_enabled
+            SELECT user_id, full_name, email, password_hash, two_factor_enabled,
+                   email_verified, google_id
             FROM users WHERE LOWER(email) = :email
         """),
         {"email": email.strip().lower()},
@@ -251,6 +269,14 @@ def register(request: RegisterRequest, db: Session = Depends(get_db)):
 
     token = create_token(user_id)
 
+    # Email a code to confirm the address. Sign-up does not wait for it: if the
+    # email is slow or fails, the account still works and the code can be
+    # requested again from the app.
+    try:
+        _issue_code(db, _user_by_email(db, request.email), "email_verify")
+    except HTTPException:
+        pass
+
     return AuthResponse(
         message   = "Account created successfully",
         user_id   = user_id,
@@ -267,6 +293,12 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     request.email = request.email.strip().lower()
 
     user = _user_by_email(db, request.email)
+
+    if user and not user.password_hash and user.google_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="This account uses Google sign-in. Tap Google below to sign in."
+        )
 
     if not user or not verify_password(request.password, user.password_hash):
         raise HTTPException(
@@ -298,7 +330,8 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
 def _profile(user_id: int, db: Session) -> dict:
     user = db.execute(
         text("""
-            SELECT user_id, full_name, email, phone, created_at, two_factor_enabled
+            SELECT user_id, full_name, email, phone, created_at, two_factor_enabled,
+                   email_verified, google_id, password_hash IS NOT NULL AS has_password
             FROM users WHERE user_id = :id
         """),
         {"id": user_id},
@@ -312,6 +345,9 @@ def _profile(user_id: int, db: Session) -> dict:
         "phone"       : user.phone,
         "member_since": user.created_at.date().isoformat() if user.created_at else None,
         "two_factor_enabled": bool(user.two_factor_enabled),
+        "email_verified": bool(user.email_verified),
+        "google_linked": user.google_id is not None,
+        "has_password": bool(user.has_password),
     }
 
 
@@ -360,7 +396,11 @@ def update_profile(
         if taken:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                                 detail="Another account already uses this email")
+        current = db.execute(text("SELECT email FROM users WHERE user_id = :id"),
+                             {"id": current_user_id}).fetchone()
         updates["email"] = email
+        if current and current.email.lower() != email:
+            updates["email_verified"] = False   # the new address has not been confirmed yet
 
     if request.phone is not None:
         phone = request.phone.strip()
@@ -389,7 +429,11 @@ def change_password(
         text("SELECT password_hash FROM users WHERE user_id = :id"),
         {"id": current_user_id},
     ).fetchone()
-    if not user or not verify_password(request.current_password, user.password_hash):
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account no longer exists")
+    # An account created with Google has no password yet: it can set one
+    # without a current password (the user is already signed in with Google).
+    if user.password_hash and not verify_password(request.current_password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail="Your current password is incorrect")
 
@@ -490,6 +534,10 @@ def set_two_factor(
         text("SELECT password_hash FROM users WHERE user_id = :id"),
         {"id": current_user_id},
     ).fetchone()
+    if user and not user.password_hash:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Set a password first (Profile > Change password). "
+                                   "Accounts that sign in with Google are already protected by Google.")
     if not user or not verify_password(request.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail="Your password is incorrect")
@@ -503,3 +551,120 @@ def set_two_factor(
         "message": "Two-step sign-in turned on" if request.enabled else "Two-step sign-in turned off",
         "two_factor_enabled": request.enabled,
     }
+
+
+# Email verification ────────────────────────────────────────────────────────
+
+# POST /authentication/send-verification
+@router.post("/send-verification")
+def send_verification(
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """Email a 6-digit code to confirm the signed-in user's email address."""
+    row = db.execute(text("SELECT email FROM users WHERE user_id = :id"),
+                     {"id": current_user_id}).fetchone()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account no longer exists")
+    user = _user_by_email(db, row.email)
+    if user.email_verified:
+        return {"message": "Your email is already verified", "email_verified": True}
+    _issue_code(db, user, "email_verify")
+    return {"message": f"We sent a code to {user.email}. It expires in {CODE_MINUTES} minutes.",
+            "email_verified": False}
+
+
+# POST /authentication/verify-email
+@router.post("/verify-email")
+def verify_email(
+    request: VerifyEmailRequest,
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """Confirm the email address with the emailed code."""
+    _check_code(db, current_user_id, "email_verify", request.code)
+    db.execute(text("UPDATE users SET email_verified = TRUE WHERE user_id = :id"),
+               {"id": current_user_id})
+    db.commit()
+    return {"message": "Email verified", "email_verified": True}
+
+
+# Google sign-in ────────────────────────────────────────────────────────────
+
+def _verify_google_token(token: str) -> dict:
+    """
+    Check the ID token's signature, expiry and audience with Google's public
+    keys and return its claims (sub, email, email_verified, name).
+    GOOGLE_CLIENT_ID is the *Web* client ID from Google Cloud, the same one
+    the app passes to Google as its server client ID.
+    """
+    client_id = os.getenv("GOOGLE_CLIENT_ID")
+    if not client_id:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Google sign-in is not set up on the server yet")
+    try:
+        return google_id_token.verify_oauth2_token(token, google_requests.Request(), client_id)
+    except google_exceptions.TransportError:
+        # Google's public keys could not be downloaded (network problem)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Could not reach Google. Please try again in a moment.")
+    except (ValueError, google_exceptions.GoogleAuthError):
+        # Bad signature, expired, or issued for a different app
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Google sign-in failed. Please try again.")
+
+
+# POST /authentication/google
+@router.post("/google", response_model=AuthResponse)
+def google_sign_in(request: GoogleSignInRequest, db: Session = Depends(get_db)):
+    """
+    Sign in with Google. An existing account with the same email is linked to
+    the Google account; otherwise a new account is created (without a
+    password). Google has already confirmed the email, so it counts as verified.
+    """
+    claims = _verify_google_token(request.id_token)
+    google_id = claims.get("sub")
+    email = (claims.get("email") or "").strip().lower()
+    if not google_id or not email or not claims.get("email_verified"):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Your Google account has no verified email address")
+
+    user = db.execute(
+        text("SELECT user_id, full_name FROM users WHERE google_id = :g"),
+        {"g": google_id},
+    ).fetchone()
+    message = "Login successful"
+
+    if not user:
+        existing = _user_by_email(db, email)
+        if existing:
+            # Link Google to the account that already uses this email
+            db.execute(
+                text("UPDATE users SET google_id = :g, email_verified = TRUE WHERE user_id = :id"),
+                {"g": google_id, "id": existing.user_id},
+            )
+            db.commit()
+            user = existing
+        else:
+            name = (claims.get("name") or email.split("@")[0]).strip()[:100]
+            created = db.execute(
+                text("""
+                    INSERT INTO users (full_name, email, google_id, email_verified)
+                    VALUES (:name, :email, :g, TRUE)
+                    RETURNING user_id, full_name
+                """),
+                {"name": name, "email": email, "g": google_id},
+            ).fetchone()
+            db.commit()
+            user = created
+            message = "Account created successfully"
+
+    # Two-step sign-in is not asked for here: the user has just proved who they
+    # are to Google, which applies its own checks (including Google's 2-step).
+    return AuthResponse(
+        message   = message,
+        user_id   = user.user_id,
+        full_name = user.full_name,
+        email     = email,
+        token     = create_token(user.user_id, remember=request.remember_me),
+    )

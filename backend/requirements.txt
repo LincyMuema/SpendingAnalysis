@@ -14,6 +14,8 @@ python-dotenv==1.2.4
 passlib==1.7.4
 bcrypt==4.0.1
 python-jose[cryptography]==3.5.0
+google-auth==2.38.0         
+requests==2.32.3            
 
 # Machine learning 
 scikit-learn==1.6.1
