@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'app_events.dart';
+import 'google_auth.dart';
 
 class ApiService {
   static String get _baseUrl =>
@@ -37,6 +38,7 @@ class ApiService {
     try {
       await _storage.deleteAll();
     } catch (_) {}
+    await GoogleAuth.signOut(); // show Google's account picker next time
   }
 
   static Future<void> _saveSession(Map<String, dynamic> data, String email) async {
@@ -206,6 +208,44 @@ class ApiService {
       await logout(); // forget any previously remembered account
       _token = data['token'];
     }
+  }
+
+  // ── Google sign-in ─────────────────────────────────────────────────────────
+  /// Signs in (or creates an account) with Google. Returns null if the user
+  /// closed Google's account picker. The result includes the account's email.
+  static Future<Map<String, dynamic>?> googleSignIn({bool rememberMe = false}) async {
+    final idToken = await GoogleAuth.getIdToken();
+    if (idToken == null) return null;
+    final response = await http.post(
+      Uri.parse('$_baseUrl/authentication/google'),
+      headers: _headers,
+      body: jsonEncode({'id_token': idToken, 'remember_me': rememberMe}),
+    );
+    final data = _decode(response);
+    if (response.statusCode == 200) {
+      await _completeLogin(data, data['email'] as String? ?? '', rememberMe);
+      return data; // has: message, user_id, full_name, email, token
+    }
+    throw Exception(data['detail'] ?? 'Google sign-in failed');
+  }
+
+  // ── Email verification ─────────────────────────────────────────────────────
+  static Future<String> sendVerification() async {
+    final response = await http.post(
+      Uri.parse('$_baseUrl/authentication/send-verification'),
+      headers: _headers,
+    );
+    final data = _check(response, 'Could not send the code');
+    return data['message'] as String? ?? 'Check your email for a code';
+  }
+
+  static Future<void> verifyEmail({required String code}) async {
+    final response = await http.post(
+      Uri.parse('$_baseUrl/authentication/verify-email'),
+      headers: _headers,
+      body: jsonEncode({'code': code}),
+    );
+    _check(response, 'Could not verify the email');
   }
 
   // ── Password reset ─────────────────────────────────────────────────────────

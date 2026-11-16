@@ -68,6 +68,31 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
+  Future<void> _handleGoogle() async {
+    setState(() => _isLoading = true);
+    try {
+      final result = await ApiService.googleSignIn(rememberMe: _remember);
+      if (result == null || !mounted) return; // picker closed
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (_) => HomeScreen(
+            fullName: result['full_name'],
+            userId: result['user_id'],
+            email: result['email'] as String?,
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(e.toString().replaceAll('Exception: ', ''))),
+      );
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
   Future<void> _forgotPassword() async {
     final email = await Navigator.push<String>(
       context,
@@ -239,9 +264,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   side: const BorderSide(color: Colors.black12),
                   backgroundColor: Colors.white,
                 ),
-                onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Google sign-in is coming soon')),
-                ),
+                onPressed: _isLoading ? null : _handleGoogle,
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [

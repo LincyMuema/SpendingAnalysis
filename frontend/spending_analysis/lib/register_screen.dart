@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'api_service.dart';
 import 'home_screen.dart';
+import 'verify_email_screen.dart';
 
 class RegisterScreen extends StatefulWidget {
   const RegisterScreen({super.key});
@@ -48,6 +49,33 @@ class _RegisterScreenState extends State<RegisterScreen> {
     });
   }
 
+  /// Sign up with Google: Google has already confirmed the email, so there
+  /// is no code to enter.
+  Future<void> _handleGoogle() async {
+    setState(() => _isLoading = true);
+    try {
+      final result = await ApiService.googleSignIn();
+      if (result == null || !mounted) return; // picker closed
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (_) => HomeScreen(
+            fullName: result['full_name'],
+            userId: result['user_id'],
+            email: result['email'] as String?,
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(e.toString().replaceAll('Exception: ', ''))),
+      );
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
   Future<void> _handleRegister() async {
     if (_fullNameController.text.trim().isEmpty ||
         _emailController.text.trim().isEmpty ||
@@ -73,13 +101,18 @@ class _RegisterScreenState extends State<RegisterScreen> {
         password: _passwordController.text,
       );
       if (!mounted) return;
+      // A code has been emailed; confirming is optional (Skip for now)
+      final email = _emailController.text.trim();
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(
-          builder: (_) => HomeScreen(
-            fullName: result['full_name'],
-            userId: result['user_id'],
-            email: _emailController.text.trim(),
+          builder: (_) => VerifyEmailScreen(
+            email: email,
+            next: () => HomeScreen(
+              fullName: result['full_name'],
+              userId: result['user_id'],
+              email: email,
+            ),
           ),
         ),
       );
@@ -312,9 +345,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   side: const BorderSide(color: Colors.black12),
                   backgroundColor: Colors.white,
                 ),
-                onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Google sign-in is coming soon')),
-                ),
+                onPressed: _isLoading ? null : _handleGoogle,
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [

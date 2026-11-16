@@ -27,6 +27,9 @@ services:
         sync: false
       - key: EMAIL_FROM
         sync: false
+      # Google sign-in: the Web client ID from Google Cloud (not secret, but kept out of the repo)
+      - key: GOOGLE_CLIENT_ID
+        sync: false
 
 databases:
   - name: pesight-db

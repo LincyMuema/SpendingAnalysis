@@ -175,7 +175,10 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
 // ── Change password ──────────────────────────────────────────────────────────
 
 class ChangePasswordScreen extends StatefulWidget {
-  const ChangePasswordScreen({super.key});
+  /// False for an account created with Google sign-in: it has no password
+  /// yet, so it sets one without entering a current password.
+  final bool hasPassword;
+  const ChangePasswordScreen({super.key, this.hasPassword = true});
 
   @override
   State<ChangePasswordScreen> createState() => _ChangePasswordScreenState();
@@ -210,7 +213,7 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
   }
 
   Future<void> _save() async {
-    if (_current.text.isEmpty) {
+    if (widget.hasPassword && _current.text.isEmpty) {
       setState(() => _error = 'Enter your current password');
       return;
     }
@@ -233,9 +236,9 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
       );
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Password changed')),
+        SnackBar(content: Text(widget.hasPassword ? 'Password changed' : 'Password set')),
       );
-      Navigator.pop(context);
+      Navigator.pop(context, true);
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -265,13 +268,15 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
     final v = _new.text;
     return Scaffold(
       backgroundColor: const Color(0xFFF5F5FA),
-      appBar: _appBar('Change password'),
+      appBar: _appBar(widget.hasPassword ? 'Change password' : 'Set a password'),
       body: SafeArea(
         child: ListView(
           padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
           children: [
-            _passwordField(_current, 'Current password'),
-            const SizedBox(height: 14),
+            if (widget.hasPassword) ...[
+              _passwordField(_current, 'Current password'),
+              const SizedBox(height: 14),
+            ],
             _passwordField(_new, 'New password'),
             const SizedBox(height: 8),
             Wrap(
@@ -305,8 +310,8 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
                       width: 22,
                       height: 22,
                       child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                  : const Text('Change password',
-                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                  : Text(widget.hasPassword ? 'Change password' : 'Set password',
+                      style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
             ),
           ],
         ),
