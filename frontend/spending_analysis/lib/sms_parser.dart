@@ -1,15 +1,18 @@
-/// Parses M-Pesa, Airtel Money and bank (I&M, Co-operative Bank, Absa)
-/// transaction SMS messages.
+/// Parses M-Pesa, Airtel Money and bank (I&M, Co-operative Bank, Absa,
+/// Standard Chartered) transaction SMS messages.
 ///
 /// Pure Dart: no Flutter or plugin dependencies, so it can be unit tested
 /// with `flutter test`.
 ///
-/// Formats verified against real messages: M-Pesa "paid to", Airtel Money
-/// "sent to", I&M Bank card purchase. M-Pesa "sent to", "received" and airtime
-/// formats are written from the standard Safaricom wording and have NOT yet
-/// been checked against real messages. Co-operative Bank M-Pesa transfers,
-/// Absa debit and credit alerts are checked against real messages. Anything unrecognised returns null so the user can
-/// add it manually.
+/// Every format below has been checked against real messages:
+///   M-Pesa: buy goods ("paid to"), paybill and send money ("sent to"),
+///           money received, airtime
+///   Airtel Money: "sent to"
+///   I&M Bank: card purchase
+///   Co-operative Bank: M-Pesa transfer from the account
+///   Absa: debit and credit alerts
+///   Standard Chartered: card payment, transfer to M-Pesa, account transfer
+/// Anything unrecognised returns null so the user can add it manually.
 
 class ParsedSms {
   final String reference; // M-Pesa / Airtel code, '' for bank SMS
@@ -74,6 +77,26 @@ class SmsParser {
       caseSensitive: false);
   static final _rAbsaCredit =
       RegExp(r'a Credit has been made for KES\s*([\d,]+(?:\.\d+)?)', caseSensitive: false);
+
+  // Standard Chartered
+  // "a transaction of KES 289.00 was made on card ending 1234 at
+  //  GOOGLE YouTubePremium on 2026-10-28."
+  static final _rScCard = RegExp(
+      r'transaction of KES\s*([\d,]+(?:\.\d+)?)\s+was made on card ending\s+\S+\s+at\s+(.+?)\s+on\s+(\d{4}-\d{2}-\d{2})',
+      caseSensitive: false);
+  // "transaction of KES 1509.00 to MPESA has been processed successfully,
+  //  ref. UK00000000 to JOHN DOE For any queries ..."
+  static final _rScToMpesa = RegExp(
+      r'transaction of KES\s*([\d,]+(?:\.\d+)?)\s+to MPESA has been processed successfully,?\s*ref\.?\s*([A-Z0-9]+)\s+to\s+(.+?)\s*(?:For any|$)',
+      caseSensitive: false);
+  // "KES 9000.00 was transferred from Acc. ending with 1111 to Acc. ending with 2222."
+  static final _rScAccount = RegExp(
+      r'KES\s*([\d,]+(?:\.\d+)?)\s+was transferred from Acc\.? ending with\s+\S+\s+to Acc\.? ending with\s+(\d+)',
+      caseSensitive: false);
+  // "JOHN DOE has transferred KES 1509.00 to your MPESA Account, ref UK00000000."
+  // The same transfer as the message above, so it is skipped.
+  static final _rScMpesaNotice = RegExp(
+      r'has transferred KES\s*[\d,.]+\s+to your MPESA Account', caseSensitive: false);
 
   // M-Pesa mini-statement: "[20260728; ;Customer Send Money; ...;Ksh30.00]Completed [...]"
   // It summarises the last 5 transactions, which already arrived as their own
@@ -193,6 +216,46 @@ class SmsParser {
       );
     }
 
+    m = _rScCard.firstMatch(text);
+    if (m != null) {
+      final merchant = _cardMerchant(m.group(2)!);
+      return ParsedSms(
+        reference: '',
+        amount: _amount(m.group(1)!),
+        date: m.group(3)!,
+        source: 'CARD',
+        counterparty: merchant,
+        category: categorise(merchant),
+        isExpense: true,
+      );
+    }
+    m = _rScToMpesa.firstMatch(text);
+    if (m != null) {
+      final name = _cleanName(m.group(3)!);
+      return ParsedSms(
+        reference: m.group(2)!, // the M-Pesa code, so it is never saved twice
+        amount: _amount(m.group(1)!),
+        date: _iso(today ?? DateTime.now()), // the message has no date
+        source: 'CARD',
+        counterparty: name,
+        category: categorise(name),
+        isExpense: !_isOwnName(name, ownName),
+      );
+    }
+    if (_rScMpesaNotice.hasMatch(text)) return null;
+    m = _rScAccount.firstMatch(text);
+    if (m != null) {
+      return ParsedSms(
+        reference: '',
+        amount: _amount(m.group(1)!),
+        date: _iso(today ?? DateTime.now()),
+        source: 'CARD',
+        counterparty: 'Account ending ${m.group(2)}',
+        category: 'Transfer',
+        isExpense: true,
+      );
+    }
+
     m = _rBank.firstMatch(text);
     if (m != null) {
       final merchant = m.group(3)!.trim();
@@ -222,7 +285,9 @@ class SmsParser {
 
   static ParsedSms _person(String ref, String amt, String rawName, String dmy,
       String source, String? ownName) {
-    final name = _cleanName(rawName);
+    final name = _cleanName(rawName
+        .replaceAll(RegExp(r'\s+for account\s+\S+$', caseSensitive: false), '') // paybill
+        .replaceAll(RegExp(r'\s+(?:teller|till)\s*\d*$', caseSensitive: false), ''));
     final isOwn = _isOwnName(name, ownName);
     return ParsedSms(
       reference: ref,
@@ -305,6 +370,15 @@ class SmsParser {
     return field.split(RegExp(r'\s{2,}')).first.trim();
   }
 
+  /// Card merchant names: "UBER PENDING" -> "UBER" (a hold not yet settled),
+  /// "GOOGLE Google One" -> "Google One" (Google Play purchases).
+  static String _cardMerchant(String raw) {
+    var name = raw.trim().replaceAll(RegExp(r'\s+PENDING$', caseSensitive: false), '');
+    final g = RegExp(r'^GOOGLE\s+(.+)$').firstMatch(name);
+    if (g != null) name = g.group(1)!;
+    return name.trim();
+  }
+
   static double _amount(String s) => double.parse(s.replaceAll(',', ''));
 
   /// Removes a trailing phone number / masked number and trailing full stop.
@@ -352,7 +426,7 @@ class SmsParser {
     'Bills & Utilities': [
       'kplc', 'kenya power', 'water', 'safaricom', 'zuku', 'faiba', 'jtl',
       'dstv', 'gotv', 'startimes', 'airtime', 'rent', 'wifi', 'internet',
-      'home fibre', 'electricity', 'nhif', 'insurance',
+      'home fibre', 'electricity', 'nhif', 'insurance', 'google one', 'icloud',
     ],
     'Education': [
       'school', 'university', 'college', 'academy', 'tuition', 'fees',

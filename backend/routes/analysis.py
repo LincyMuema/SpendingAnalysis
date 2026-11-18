@@ -57,6 +57,9 @@ FALLBACK_CATEGORY = "Groceries"
 # looks "new" and every amount looks unusual. Scores just below zero are
 # borderline, so only clearer cases are shown.
 ANOMALY_WARMUP_DAYS = 14
+# Feedback: once a payment is marked "Not unusual", later payments to the same
+# payee up to this much larger are treated as normal for that user too.
+FEEDBACK_AMOUNT_MARGIN = 1.25
 ANOMALY_SCORE_CUTOFF = -0.03
 # Anomalies are alerts, so only recent ones are shown, recurring payments
 # (e.g. monthly rent) are skipped, and only the most unusual few are listed.
@@ -549,6 +552,41 @@ def _is_recurring(row, df: pd.DataFrame) -> bool:
     return bool(((gap >= RECURRING_GAP_DAYS[0]) & (gap <= RECURRING_GAP_DAYS[1]) & similar).any())
 
 
+def _payee_key(name) -> str:
+    """'Java House.' and 'JAVA HOUSE' are the same payee."""
+    return "".join(ch for ch in str(name or "").upper() if ch.isalnum())
+
+
+def _normal_by_feedback(candidates: pd.DataFrame, df: pd.DataFrame) -> pd.Series:
+    """
+    True for flagged payments the user has already told us are normal:
+    the same payee (or, with no payee, the same category) as a payment they
+    marked "Not unusual", for an amount no more than FEEDBACK_AMOUNT_MARGIN
+    times the largest amount they marked. A much larger payment to the same
+    place is still flagged, and so is a possible double charge (the same
+    amount again within an hour), which feedback never hides.
+    """
+    dismissed = df[df["anomaly_dismissed"].fillna(False).astype(bool)]
+    if dismissed.empty or candidates.empty:
+        return pd.Series(False, index=candidates.index)
+
+    by_payee, by_category = {}, {}
+    for _, d in dismissed.iterrows():
+        key = _payee_key(d["counterparty"])
+        target = by_payee if key else by_category
+        k = key or str(d["category_name"])
+        target[k] = max(target.get(k, 0.0), float(d["amount"]))
+
+    def is_normal(row) -> bool:
+        if row["dup_1h"] == 1:
+            return False
+        key = _payee_key(row["counterparty"])
+        limit = by_payee.get(key) if key else by_category.get(str(row["category_name"]))
+        return limit is not None and row["amount"] <= FEEDBACK_AMOUNT_MARGIN * limit
+
+    return candidates.apply(is_normal, axis=1)
+
+
 def _fmt_time(row) -> str | None:
     """'2:14 PM' when the exact time is known, otherwise None."""
     if not row["time_known"]:
@@ -631,6 +669,11 @@ def run_anomaly_detection(df: pd.DataFrame) -> dict:
         ~candidates.apply(lambda row: _is_recurring(row, featured_df), axis=1)
     ] if len(candidates) else candidates
 
+    # Learn from feedback: skip payments like ones the user marked as normal
+    learned = _normal_by_feedback(candidates, featured_df)
+    hidden_by_feedback = int(learned.sum())
+    candidates = candidates[~learned]
+
     # Show only the most unusual few
     anomalies = candidates.sort_values("anomaly_score").head(ANOMALY_MAX_SHOWN)
     anomaly_rate = (len(anomalies) / len(featured_df) * 100) if len(featured_df) else 0
@@ -658,6 +701,7 @@ def run_anomaly_detection(df: pd.DataFrame) -> dict:
         "model_flagged_count": int(model_flagged),  # before the display rules
         "recent_days": ANOMALY_RECENT_DAYS,
         "anomaly_count": int(len(anomalies)),
+        "hidden_by_feedback_count": hidden_by_feedback,  # similar to ones marked normal
         "anomaly_rate_pct": round(float(anomaly_rate), 2),
         "anomalies": anomaly_list,
     }

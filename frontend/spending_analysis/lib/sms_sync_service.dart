@@ -53,6 +53,7 @@ class SmsSyncService {
     'IANDMBANK',    // I&M Bank
     'COOPBANK',     // Co-operative Bank
     'ABSABANK',     // Absa Bank Kenya
+    'STANCHART',    // Standard Chartered
   ];
 
   static bool isFinancialSender(String? address) {
