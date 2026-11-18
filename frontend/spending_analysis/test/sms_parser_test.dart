@@ -29,6 +29,42 @@ void main() {
       expect(r.amount, 45.00);
       expect(r.category, 'Shopping');
     });
+
+    test('buy goods: the teller number is removed', () {
+      final r = SmsParser.parse(
+          'TST0000A06 Confirmed. Ksh480.00 paid to CHINA SQUARE LANGATA TELLER 1. on 18/11/26 at 7:08 PM.New M-PESA balance is Ksh1,000.00. Transaction cost, Ksh0.00. Amount you can transact within the day is 499,480.00. See all your balances now https://saf.cx/')!;
+      expect(r.amount, 480.00);
+      expect(r.date, '2026-11-18');
+      expect(r.counterparty, 'CHINA SQUARE LANGATA');
+      expect(r.category, 'Shopping');
+    });
+
+    test('paybill: the account number is removed', () {
+      final r = SmsParser.parse(
+          'TST0000A07 Confirmed. Ksh40.00 sent to LIPAKITU LIMITED for account 1234 on 18/11/26 at 7:42 AM New M-PESA balance is Ksh1,000.00. Transaction cost, Ksh0.00.Amount you can transact within the day is 499,960.00. See all your balances now https://saf.cx/')!;
+      expect(r.reference, 'TST0000A07');
+      expect(r.amount, 40.00);
+      expect(r.counterparty, 'LIPAKITU LIMITED');
+      expect(r.isExpense, true);
+    });
+
+    test('money received: masked phone number removed, not an expense', () {
+      final r = SmsParser.parse(
+          'TST0000A08 Confirmed.You have received Ksh100.00 from MARY  WANJIRU 0700***000 on 18/11/26 at 10:34 AM  New M-PESA balance is Ksh1,000.00. Invest & earn daily interest with ZIIDI on https://saf.cx/')!;
+      expect(r.amount, 100.00);
+      expect(r.counterparty, 'MARY WANJIRU');
+      expect(r.isExpense, false);
+    });
+
+    test('airtime (lower-case "confirmed")', () {
+      final r = SmsParser.parse(
+          'TST0000A09 confirmed.You bought Ksh5.00 of airtime on 18/11/26 at 9:58 PM.New M-PESA balance is Ksh1,000.00. Transaction cost, Ksh0.00. Amount you can transact within the day is 499,475.00. See all your balances now https://saf.cx/')!;
+      expect(r.reference, 'TST0000A09');
+      expect(r.amount, 5.00);
+      expect(r.date, '2026-11-18');
+      expect(r.counterparty, 'Airtime');
+      expect(r.category, 'Bills & Utilities');
+    });
   });
 
   group('Airtel Money', () {
@@ -123,6 +159,75 @@ void main() {
       final r = SmsParser.parse(
           'Dear Customer a Credit has been made for KES60000 on your Account XX0000 VIA Digital/Branch Banking please call 0700000000 for any enquiries')!;
       expect(r.isExpense, false);
+    });
+  });
+
+  group('Standard Chartered', () {
+    test('card payment', () {
+      final r = SmsParser.parse(
+          'Dear Client, a transaction of KES 1200.00 was made on card ending 0000 at MILWAYS INTERIOR on 2026-10-30. For any queries call +254 20 0000000')!;
+      expect(r.amount, 1200.00);
+      expect(r.date, '2026-10-30');
+      expect(r.source, 'CARD');
+      expect(r.counterparty, 'MILWAYS INTERIOR');
+      expect(r.isExpense, true);
+    });
+
+    test('Google subscriptions and pending card holds are tidied', () {
+      final yt = SmsParser.parse(
+          'Dear Client, a transaction of KES 289.00 was made on card ending 0000 at GOOGLE YouTubePremium on 2026-10-28. For any queries call +254 20 0000000')!;
+      expect(yt.counterparty, 'YouTubePremium');
+      expect(yt.category, 'Entertainment');
+      final one = SmsParser.parse(
+          'Dear Client, a transaction of KES 273.14 was made on card ending 0000 at GOOGLE Google One on 2026-11-03. For any queries call +254 20 0000000')!;
+      expect(one.amount, 273.14);
+      expect(one.counterparty, 'Google One');
+      expect(one.category, 'Bills & Utilities');
+      final uber = SmsParser.parse(
+          'Dear Client, a transaction of KES 222.00 was made on card ending 0000 at UBER PENDING on 2026-11-01. For any queries call +254 20 0000000')!;
+      expect(uber.counterparty, 'UBER');
+      expect(uber.category, 'Transport');
+    });
+
+    test('transfer to M-Pesa uses the M-Pesa code', () {
+      final r = SmsParser.parse(
+          'Dear Client, transaction of KES 1509.00 to MPESA has been processed successfully, ref. TST0000S01 to JOHN KAMAU For any queries contact us on  +254 20 0000000',
+          today: DateTime(2026, 11, 2))!;
+      expect(r.reference, 'TST0000S01');
+      expect(r.amount, 1509.00);
+      expect(r.date, '2026-11-02');
+      expect(r.counterparty, 'JOHN KAMAU');
+      expect(r.isExpense, true);
+    });
+
+    test('transfer to your own M-Pesa is not an expense', () {
+      final r = SmsParser.parse(
+          'Dear Client, transaction of KES 1509.00 to MPESA has been processed successfully, ref. TST0000S02 to JOHN KAMAU For any queries contact us on +254 20 0000000',
+          ownName: 'John Kamau')!;
+      expect(r.isExpense, false);
+    });
+
+    test('the second notice of the same M-Pesa transfer is skipped', () {
+      expect(
+          SmsParser.parse(
+              'Good day, JOHN KAMAU has transferred KES 1509.00 to your MPESA Account, ref  TST0000S01. For any queries, call us on 254 20 0000000'),
+          isNull);
+    });
+
+    test('account to account transfer', () {
+      final r = SmsParser.parse(
+          'Dear Client, KES 9000.00 was transferred from Acc. ending with 1111 to Acc. ending with 2222. For any queries call +254 20 0000000')!;
+      expect(r.amount, 9000.00);
+      expect(r.counterparty, 'Account ending 2222');
+      expect(r.category, 'Transfer');
+    });
+
+    test('service notice is ignored', () {
+      expect(
+          SmsParser.parse(
+              'Dear Client, as part of scheduled system enhancements, ATM services will be unavailable tomorrow, 31 October 2026, from 6:30 am to 9:30 am. Online Banking and the SC Mobile app will be unavailable from 3:30 am to 7:30 am. Thank you for banking with Standard Chartered.',
+              sender: 'StanChart'),
+          isNull);
     });
   });
 

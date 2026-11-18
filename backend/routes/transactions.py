@@ -370,8 +370,10 @@ def dismiss_anomaly(
 ):
     """
     The user confirms a flagged transaction is normal.
-    It will no longer appear in the anomaly list. The stored feedback can
-    also be used as labelled data when the model is retrained.
+    It will no longer appear in the anomaly list, and later payments to the
+    same payee for a similar amount are not flagged either (see
+    _normal_by_feedback in analysis.py). The stored feedback can also be used
+    as labelled data if the model is retrained in future.
     """
     transaction = db.execute(
         text("SELECT transaction_id FROM transactions WHERE transaction_id = :id AND user_id = :user_id"),

@@ -798,12 +798,20 @@ class _AnomaliesTab extends StatefulWidget {
 class _AnomaliesTabState extends State<_AnomaliesTab> {
   late List<Map<String, dynamic>> _anomalies;
   late int _total;
+  late int _hidden; // payments like ones the user marked as normal
   final Set<int> _busy = {};
+
+  static String _payeeKey(Object? name) =>
+      (name ?? '').toString().toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
+
+  static bool _isDoubleCharge(Map<String, dynamic> a) =>
+      (a['reasons'] as List? ?? []).any((r) => r.toString().contains('less than an hour'));
 
   void _readData() {
     final anomaly =
         Map<String, dynamic>.from(widget.data['anomaly_detection'] ?? {});
     _total = anomaly['total_transactions'] as int? ?? 0;
+    _hidden = anomaly['hidden_by_feedback_count'] as int? ?? 0;
     _anomalies = List<Map<String, dynamic>>.from(
         (anomaly['anomalies'] as List? ?? [])
             .map((e) => Map<String, dynamic>.from(e as Map)));
@@ -828,12 +836,26 @@ class _AnomaliesTabState extends State<_AnomaliesTab> {
       await ApiService.dismissAnomaly(transactionId: id);
       AppEvents.notifyTransactionsChanged(); // lets the Home card update
       if (!mounted) return;
+      // Same rule as the backend: other payments to the same payee, up to 25%
+      // larger, are normal too (possible double charges are always kept).
+      final key = _payeeKey(a['counterparty']);
+      final limit = 1.25 * ((a['amount'] as num?)?.toDouble() ?? 0);
+      bool alsoNormal(Map<String, dynamic> x) =>
+          x['transaction_id'] != id &&
+          key.isNotEmpty &&
+          _payeeKey(x['counterparty']) == key &&
+          ((x['amount'] as num?)?.toDouble() ?? 0) <= limit &&
+          !_isDoubleCharge(x);
       setState(() {
-        _anomalies.removeWhere((x) => x['transaction_id'] == id);
+        _hidden += _anomalies.where(alsoNormal).length;
+        _anomalies.removeWhere((x) => x['transaction_id'] == id || alsoNormal(x));
         _busy.remove(id);
       });
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Marked as normal. It will not be flagged again.')));
+      final who = (a['counterparty'] as String?)?.trim();
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(who == null || who.isEmpty
+              ? 'Marked as normal. Similar payments will not be flagged again.'
+              : 'Marked as normal. Similar payments to $who will not be flagged again.')));
     } catch (e) {
       if (!mounted) return;
       setState(() => _busy.remove(id));
@@ -908,10 +930,27 @@ class _AnomaliesTabState extends State<_AnomaliesTab> {
           ),
         ),
 
+        if (_hidden > 0) ...[
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              const Icon(Icons.school_outlined, size: 16, color: Color(0xFF5B2EFF)),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  '$_hidden payment${_hidden > 1 ? 's' : ''} like ones you marked as normal '
+                  '${_hidden > 1 ? 'are' : 'is'} no longer flagged.',
+                  style: const TextStyle(color: Colors.black54, fontSize: 12, height: 1.4),
+                ),
+              ),
+            ],
+          ),
+        ],
+
         if (_anomalies.isNotEmpty) ...[
           const SizedBox(height: 12),
           const Text(
-            'Recognise one of these? Tap "Not unusual" and it will not be flagged again.',
+            'Recognise one of these? Tap "Not unusual" and similar payments to the same place will not be flagged again.',
             style: TextStyle(color: Colors.black45, fontSize: 12, height: 1.4),
           ),
           const SizedBox(height: 12),
