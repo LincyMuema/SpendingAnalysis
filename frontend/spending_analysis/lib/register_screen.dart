@@ -3,6 +3,7 @@ import 'api_service.dart';
 import 'home_screen.dart';
 import 'verify_email_screen.dart';
 import 'google_button.dart';
+import 'legal_screen.dart';
 
 class RegisterScreen extends StatefulWidget {
   const RegisterScreen({super.key});
@@ -290,17 +291,11 @@ class _RegisterScreenState extends State<RegisterScreen> {
                       Expanded(
                         child: Padding(
                           padding: const EdgeInsets.only(top: 12),
-                          child: RichText(
-                            text: const TextSpan(
-                              style: TextStyle(color: Colors.black54, fontSize: 12),
-                              children: [
-                                TextSpan(text: "I agree to Pesight's "),
-                                TextSpan(text: 'Terms of Service', style: TextStyle(color: Color(0xFF5B2EFF))),
-                                TextSpan(text: ' and acknowledge our '),
-                                TextSpan(text: 'Privacy Policy', style: TextStyle(color: Color(0xFF5B2EFF))),
-                                TextSpan(text: '.'),
-                              ],
-                            ),
+                          child: GestureDetector(
+                            onTap: () => setState(() => _agreed = !_agreed),
+                            child: const LegalLinks(
+                                prefix: "I am 18 or older and agree to Pesight's ",
+                                align: TextAlign.start),
                           ),
                         ),
                       ),
@@ -342,6 +337,8 @@ class _RegisterScreenState extends State<RegisterScreen> {
                 label: 'Sign up with Google',
                 onPressed: _isLoading ? null : _handleGoogle,
               ),
+              const SizedBox(height: 10),
+              const LegalLinks(prefix: 'By continuing with Google, you agree to our '),
               const SizedBox(height: 20),
 
               // Sign in link

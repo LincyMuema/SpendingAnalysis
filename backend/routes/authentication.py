@@ -63,6 +63,10 @@ class ChangePasswordRequest(BaseModel):
     current_password : str
     new_password     : str
 
+class DeleteAccountRequest(BaseModel):
+    password : Optional[str] = None   # needed when the account has a password
+    confirm  : Optional[str] = None   # Google-only accounts type DELETE instead
+
 class AuthResponse(BaseModel):
     message   : str
     user_id   : Optional[int] = None
@@ -451,6 +455,39 @@ def change_password(
     )
     db.commit()
     return {"message": "Password changed"}
+
+
+# POST /authentication/delete-account
+@router.post("/delete-account")
+def delete_account(
+    request: DeleteAccountRequest,
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """
+    Permanently delete the signed-in user's account and everything linked to
+    it: transactions, custom categories, merchant rules, codes and saved
+    analyses (all removed by ON DELETE CASCADE). The user confirms with their
+    password, or, for an account created with Google, by typing DELETE.
+    """
+    user = db.execute(
+        text("SELECT password_hash FROM users WHERE user_id = :id"),
+        {"id": current_user_id},
+    ).fetchone()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account no longer exists")
+
+    if user.password_hash:
+        if not verify_password(request.password or "", user.password_hash):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Your password is incorrect")
+    elif (request.confirm or "").strip().upper() != "DELETE":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Type DELETE to confirm")
+
+    db.execute(text("DELETE FROM users WHERE user_id = :id"), {"id": current_user_id})
+    db.commit()
+    return {"message": "Your account and all its data have been deleted"}
 
 
 # Password reset ────────────────────────────────────────────────────────────

@@ -752,6 +752,19 @@ def run_prediction(df: pd.DataFrame, today=None) -> dict:
     end = start + timedelta(weeks=4) - timedelta(days=1)
     usual = float(last["long_mean"])
 
+    # The first forecast week is usually the week in progress: report what
+    # has been spent in it so far, so the app can show progress against it.
+    this_week = None
+    today_ts = pd.Timestamp(today or datetime.now().date()).normalize()
+    if start <= today_ts <= start + timedelta(days=6):
+        spent = float(df.loc[(df["date"] >= start) & (df["date"] <= today_ts), "amount"].sum())
+        this_week = {
+            "start_date": str(start.date()),
+            "spent_kes": round(spent, 2),
+            "days_elapsed": int((today_ts - start).days) + 1,   # including today
+            "days_left": int(6 - (today_ts - start).days),       # after today
+        }
+
     recent = weekly.tail(8)
     return {
         "status": "ok",
@@ -768,6 +781,7 @@ def run_prediction(df: pd.DataFrame, today=None) -> dict:
             "high_kes": round(weekly_avg * FORECAST_RANGE[1], 2),
             "change_vs_usual_pct": round((weekly_avg - usual) / usual * 100, 1) if usual > 0 else 0.0,
         },
+        "this_week": this_week,
         "recent_weeks": [
             {
                 "week_start": str(r["week"].start_time.date()),

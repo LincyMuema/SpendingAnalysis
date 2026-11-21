@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_sms_inbox/flutter_sms_inbox.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'api_service.dart';
+import 'app_prefs.dart';
 import 'sms_parser.dart';
 
 class SmsSyncResult {
@@ -42,24 +43,74 @@ class SmsSyncResult {
   }
 }
 
+/// An account whose SMS Pesight can read.
+class SmsSource {
+  final String key; // sender name, upper case without spaces or symbols
+  final String label;
+  const SmsSource(this.key, this.label);
+}
+
 class SmsSyncService {
   /// Only messages from these senders are read. Personal messages are skipped
   /// without being parsed. Matching ignores case, spaces and symbols, and
   /// "contains" is used so variants like "AirtelMoneyy" still match.
   /// To support another bank, add its sender name here.
-  static const List<String> financialSenders = [
-    'MPESA',        // Safaricom M-Pesa
-    'AIRTELMONEY',  // Airtel Money
-    'IANDMBANK',    // I&M Bank
-    'COOPBANK',     // Co-operative Bank
-    'ABSABANK',     // Absa Bank Kenya
-    'STANCHART',    // Standard Chartered
+  /// The user can switch any of them off (Profile > Accounts to read), for
+  /// example a business account they do not want in their analysis.
+  static const List<SmsSource> sources = [
+    SmsSource('MPESA', 'M-Pesa'),
+    SmsSource('AIRTELMONEY', 'Airtel Money'),
+    SmsSource('IANDMBANK', 'I&M Bank'),
+    SmsSource('COOPBANK', 'Co-operative Bank'),
+    SmsSource('ABSABANK', 'Absa'),
+    SmsSource('STANCHART', 'Standard Chartered'),
   ];
 
-  static bool isFinancialSender(String? address) {
+  static List<String> get financialSenders => [for (final s in sources) s.key];
+
+  /// The source key this sender belongs to, or null for personal messages.
+  static String? sourceOf(String? address) {
     final a = (address ?? '').toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
-    if (a.isEmpty) return false;
-    return financialSenders.any((s) => a.contains(s));
+    if (a.isEmpty) return null;
+    for (final s in sources) {
+      if (a.contains(s.key)) return s.key;
+    }
+    return null;
+  }
+
+  static bool isFinancialSender(String? address, {Set<String> off = const {}}) {
+    final key = sourceOf(address);
+    return key != null && !off.contains(key);
+  }
+
+  /// Reads all messages in the inbox (asks for SMS access if needed).
+  static Future<List<SmsMessage>?> _inbox() async {
+    var status = await Permission.sms.status;
+    if (!status.isGranted) status = await Permission.sms.request();
+    if (!status.isGranted) return null;
+    return SmsQuery().querySms(kinds: [SmsQueryKind.inbox], count: 1000);
+  }
+
+  /// Removes transactions already imported from one account (for example
+  /// after the user switches off a business account). Re-reads that sender's
+  /// messages, works out the same references used when importing them, and
+  /// asks the server to delete those. Hand-typed transactions are untouched.
+  /// Returns the number removed.
+  static Future<int> removeImportedFrom(String sourceKey, {String? ownName}) async {
+    final messages = await _inbox();
+    if (messages == null) {
+      throw Exception('SMS access is needed to find those transactions.');
+    }
+    final refs = <String>{};
+    for (final m in messages) {
+      if (sourceOf(m.address) != sourceKey) continue;
+      final body = (m.body ?? '').trim();
+      if (body.isEmpty) continue;
+      final p = SmsParser.parse(body, ownName: ownName, today: m.date, sender: m.address);
+      if (p == null) continue;
+      refs.add(p.reference.isNotEmpty ? p.reference : _bankRef(body));
+    }
+    return ApiService.removeImported(references: refs.toList());
   }
 
   /// Reads the inbox, parses transaction messages and saves them.
@@ -96,6 +147,7 @@ class SmsSyncService {
       return SmsSyncResult(error: 'Could not read your messages: $e');
     }
 
+    final off = await AppPrefs.sourcesOff(); // accounts the user switched off
     final cutoff = DateTime.now().subtract(Duration(days: sinceDays));
     final cutoffIso =
         '${cutoff.year.toString().padLeft(4, '0')}-${cutoff.month.toString().padLeft(2, '0')}-${cutoff.day.toString().padLeft(2, '0')}';
@@ -111,7 +163,7 @@ class SmsSyncService {
       }
 
       // Check the sender first: personal messages are never parsed
-      if (!isFinancialSender(m.address)) continue;
+      if (!isFinancialSender(m.address, off: off)) continue;
 
       final body = (m.body ?? '').trim();
       if (body.isEmpty) continue;
