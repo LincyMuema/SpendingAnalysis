@@ -3,6 +3,8 @@ import 'login_screen.dart';
 import 'home_screen.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'api_service.dart';
+import 'app_prefs.dart';
+import 'welcome_screen.dart';
 
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
@@ -48,11 +50,12 @@ class _SessionGateState extends State<SessionGate> {
 
   Future<void> _decide() async {
     final user = await ApiService.restoreSession();
+    final welcomeSeen = await AppPrefs.welcomeSeen();
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(
         builder: (_) => user == null
-            ? const LoginScreen()
+            ? (welcomeSeen ? const LoginScreen() : const WelcomeScreen())
             : HomeScreen(
                 fullName: user['full_name'] ?? '',
                 userId: user['user_id'] as int,

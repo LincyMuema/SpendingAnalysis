@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import 'api_service.dart';
 import 'app_events.dart';
 import 'edit_profile_screen.dart';
+import 'legal_screen.dart';
 import 'login_screen.dart';
+import 'sms_accounts_screen.dart';
 import 'sms_sync_service.dart';
 import 'verify_email_screen.dart';
 
@@ -209,6 +211,84 @@ class _ProfileScreenState extends State<ProfileScreen> {
     ));
   }
 
+  /// Permanently deletes the account after confirming with the password
+  /// (or by typing DELETE for an account created with Google).
+  Future<void> _deleteAccount() async {
+    final controller = TextEditingController();
+    String? error;
+    bool deleting = false;
+    final deleted = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialog) => AlertDialog(
+          title: const Text('Delete your account?'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'This permanently deletes your account, all your transactions, categories and analysis. It cannot be undone.',
+                style: TextStyle(fontSize: 13.5, height: 1.4),
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: controller,
+                obscureText: _hasPassword,
+                autofocus: true,
+                decoration: InputDecoration(
+                  labelText: _hasPassword ? 'Your password' : 'Type DELETE to confirm',
+                  errorText: error,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: deleting ? null : () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: deleting
+                  ? null
+                  : () async {
+                      setDialog(() {
+                        deleting = true;
+                        error = null;
+                      });
+                      try {
+                        await ApiService.deleteAccount(
+                          password: _hasPassword ? controller.text : null,
+                          confirm: _hasPassword ? null : controller.text,
+                        );
+                        if (ctx.mounted) Navigator.pop(ctx, true);
+                      } catch (e) {
+                        setDialog(() {
+                          deleting = false;
+                          error = e.toString().replaceAll('Exception: ', '');
+                        });
+                      }
+                    },
+              child: deleting
+                  ? const SizedBox(
+                      width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Text('Delete',
+                      style: TextStyle(color: Color(0xFFE53935), fontWeight: FontWeight.w600)),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (deleted != true || !mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const LoginScreen()),
+      (route) => false,
+    );
+    messenger.showSnackBar(const SnackBar(
+        content: Text('Your account and all its data have been deleted.')));
+  }
+
   void _logout() {
     showDialog(
       context: context,
@@ -367,6 +447,16 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       ),
                     ),
                   ),
+                  const SizedBox(height: 4),
+                  _ActionRow(
+                    icon: Icons.account_balance_outlined,
+                    label: 'Accounts to read',
+                    subtitle: 'Choose which M-Pesa and bank messages are used',
+                    onTap: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => SmsAccountsScreen(ownName: _name)),
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -474,12 +564,33 @@ class _ProfileScreenState extends State<ProfileScreen> {
               title: 'Your data and privacy',
               children: [
                   _Bullet('Transaction messages are processed on your phone. Only the amount, date, merchant and payment method are saved, never the full message text.'),
-                  _Bullet('Only messages from M-Pesa, Airtel Money, I&M Bank, Co-operative Bank, Absa and Standard Chartered are read. Personal messages are skipped without being opened.'),
+                  _Bullet('Only messages from M-Pesa, Airtel Money, I&M Bank, Co-operative Bank, Absa and Standard Chartered are read, and only the accounts you leave switched on. Personal messages are skipped without being opened.'),
                   _Bullet('Your password is stored encrypted (hashed), and every request to the server needs your login token.'),
+                  _Bullet('You can delete your account and all its data at any time (bottom of this page).'),
               ],
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 12),
 
+            // Legal
+            _Card(
+              child: Column(
+                children: [
+                  _ActionRow(
+                    icon: Icons.privacy_tip_outlined,
+                    label: 'Privacy Policy',
+                    subtitle: 'What is collected and your rights',
+                    onTap: () => LegalScreen.open(context, LegalDoc.privacy),
+                  ),
+                  const Divider(height: 1, color: Colors.black12),
+                  _ActionRow(
+                    icon: Icons.description_outlined,
+                    label: 'Terms of Use',
+                    subtitle: 'The rules for using Pesight',
+                    onTap: () => LegalScreen.open(context, LegalDoc.terms),
+                  ),
+                ],
+              ),
+            ),
             const SizedBox(height: 12),
 
             // About (tap to expand)
@@ -487,14 +598,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
               icon: Icons.info_outline,
               title: 'About Pesight',
               children: [
-                  Text('Pesight  •  version 1.0.0',
+                  Text('Pesight  •  version 1.0.1',
                       style: TextStyle(
                           color: Color(0xFF1A1A2E),
                           fontWeight: FontWeight.w600,
                           fontSize: 14)),
                   SizedBox(height: 6),
                   Text(
-                    'Spending habits, unusual-transaction alerts and weekly forecasts are produced by machine learning models (K-Means, Isolation Forest and Random Forest). Forecasts are estimates, not guarantees.',
+                    'Your spending habits, unusual payments and forecasts are worked out automatically from your own transactions. Forecasts are estimates, not guarantees.',
                     style: TextStyle(color: Colors.black54, fontSize: 12, height: 1.5),
                   ),
               ],
@@ -512,6 +623,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 minimumSize: const Size(double.infinity, 48),
                 shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12)),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Center(
+              child: TextButton(
+                onPressed: _deleteAccount,
+                child: const Text('Delete account',
+                    style: TextStyle(color: Color(0xFFE53935), fontSize: 13)),
               ),
             ),
           ],

@@ -5,6 +5,7 @@ import 'analysis_screen.dart';
 import 'api_service.dart';
 import 'app_events.dart';
 import 'profile_screen.dart';
+import 'sms_setup_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   final String fullName;
@@ -38,6 +39,9 @@ class _HomeScreenState extends State<HomeScreen> {
           email: widget.email),
     ];
     AppEvents.openAnalysisTab.addListener(_goToAnalysis);
+    // New user, or signed in on a new phone: explain and ask for SMS access
+    WidgetsBinding.instance.addPostFrameCallback((_) => SmsSetupScreen.showIfNeeded(
+        context, userId: widget.userId, ownName: widget.fullName));
   }
 
   @override

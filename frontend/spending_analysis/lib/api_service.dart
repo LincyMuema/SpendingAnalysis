@@ -42,8 +42,12 @@ class ApiService {
     _session++;
     _token = null;
     AppEvents.fullName.value = null; // forget the previous user's name
+    // Only the login details are removed; device settings such as "welcome
+    // screen seen" or which SMS accounts to read are kept (see app_prefs.dart).
     try {
-      await _storage.deleteAll();
+      for (final k in [_kToken, _kUserId, _kName, _kEmail]) {
+        await _storage.delete(key: k);
+      }
     } catch (_) {}
     await GoogleAuth.signOut(); // show Google's account picker next time
   }
@@ -476,5 +480,38 @@ class ApiService {
     );
     final data = _check(response, 'Failed to update two-step sign-in');
     return data['two_factor_enabled'] == true;
+  }
+
+  // ── Delete account ─────────────────────────────────────────────────────────
+  /// Permanently deletes the account and all its data, then logs out.
+  /// Accounts with a password confirm with it; Google-only accounts send
+  /// confirm: "DELETE".
+  static Future<void> deleteAccount({String? password, String? confirm}) async {
+    final response = await http.post(
+      Uri.parse('$_baseUrl/authentication/delete-account'),
+      headers: _headers,
+      body: jsonEncode({
+        if (password != null) 'password': password,
+        if (confirm != null) 'confirm': confirm,
+      }),
+    );
+    _check(response, 'Failed to delete your account');
+    await logout();
+  }
+
+  // ── Remove SMS imports ─────────────────────────────────────────────────────
+  /// Deletes imported (not hand-typed) transactions with these references.
+  /// Returns how many were removed.
+  static Future<int> removeImported({required List<String> references}) async {
+    if (references.isEmpty) return 0;
+    final response = await http.post(
+      Uri.parse('$_baseUrl/transactions/remove-imported'),
+      headers: _headers,
+      body: jsonEncode({'references': references}),
+    );
+    final data = _check(response, 'Failed to remove transactions');
+    final removed = (data['removed_count'] as num?)?.toInt() ?? 0;
+    if (removed > 0) AppEvents.notifyTransactionsChanged();
+    return removed;
   }
 }

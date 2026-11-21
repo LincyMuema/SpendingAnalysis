@@ -5,6 +5,7 @@ POST /transactions — a new transaction
 GET  /transactions/{user_id}   — get all transactions for a user
 PATCH /transactions/{id}/category — update a transaction category
 PATCH /transactions/{id}/dismiss-anomaly — mark a flagged transaction as normal
+POST /transactions/remove-imported — delete SMS imports by reference (e.g. a business account)
 
 Every endpoint requires a login token. The user is taken from the token,
 so a user can only read or change their own transactions.
@@ -35,6 +36,9 @@ class TransactionRequest(BaseModel):
     category_name    : Optional[str] = "Other"
     is_manual        : Optional[bool] = False
     reference        : Optional[str] = None   # M-Pesa / Airtel code, used to avoid duplicates
+
+class RemoveImportedRequest(BaseModel):
+    references : list[str] = Field(default_factory=list, max_length=5000)
 
 class CategoryUpdateRequest(BaseModel):
     category_name : str
@@ -400,3 +404,29 @@ def dismiss_anomaly(
         "message"        : "Transaction marked as not unusual",
         "transaction_id" : transaction_id
     }
+
+
+# POST /transactions/remove-imported
+@router.post("/remove-imported")
+def remove_imported(
+    request: RemoveImportedRequest,
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """
+    Delete transactions that were imported from SMS, found by their references.
+    Used when a user stops reading an account (for example a business bank
+    account): the app re-reads that sender's messages, works out the same
+    references it used when importing them, and sends them here.
+    Transactions the user typed in by hand are never removed.
+    """
+    refs = sorted({r.strip() for r in request.references if r and r.strip()})
+    if not refs:
+        return {"removed_count": 0}
+    result = db.execute(
+        text("""DELETE FROM transactions
+                WHERE user_id = :u AND is_manual = FALSE AND reference = ANY(:refs)"""),
+        {"u": current_user_id, "refs": refs},
+    )
+    db.commit()
+    return {"removed_count": result.rowcount}

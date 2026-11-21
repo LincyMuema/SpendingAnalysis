@@ -5,6 +5,7 @@ import 'home_screen.dart';
 import 'forgot_password_screen.dart';
 import 'verify_login_screen.dart';
 import 'google_button.dart';
+import 'legal_screen.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -257,6 +258,8 @@ class _LoginScreenState extends State<LoginScreen> {
                 label: 'Sign in with Google',
                 onPressed: _isLoading ? null : _handleGoogle,
               ),
+              const SizedBox(height: 10),
+              const LegalLinks(prefix: 'By continuing with Google, you agree to our '),
               const SizedBox(height: 24),
 
               // Sign up link
