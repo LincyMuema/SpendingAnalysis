@@ -104,6 +104,9 @@ class SmsParser {
   static final _rMiniStatement =
       RegExp(r'\[\d{8};[^\]]*;\s*Ksh[\d,.]+\]\s*Completed', caseSensitive: false);
 
+  // M-Shwari and Ziidi messages are savings and investment moves, not spending.
+  static final _rSavings = RegExp(r'm[\s-]?shwari|ziidi', caseSensitive: false);
+
   // Fallback for bank alerts we have not seen before
   static final _rAnyAmount =
       RegExp(r'(?:kes|ksh)\s?([\d,]+(?:\.\d+)?)', caseSensitive: false);
@@ -132,6 +135,10 @@ class SmsParser {
 
     // Statements and summaries are not individual transactions
     if (_rMiniStatement.hasMatch(text)) return null;
+
+    // Moving money into or out of savings and investments (M-Shwari, Ziidi)
+    // is not spending or income, so these messages are not imported
+    if (_rSavings.hasMatch(text)) return null;
 
     Match? m;
 

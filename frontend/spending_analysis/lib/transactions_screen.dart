@@ -16,6 +16,24 @@ const List<String> kCategories = [
 
 const List<String> kSources = ['MPESA', 'CARD', 'CASH', 'WALLET'];
 
+/// What each stored payment method is called on screen. Only the wording
+/// changes: the stored values (MPESA, CARD, CASH, WALLET) stay the same,
+/// because the models were trained on them.
+String sourceLabel(String code) {
+  switch (code.toUpperCase()) {
+    case 'MPESA':
+      return 'Mobile Money';
+    case 'CARD':
+      return 'Bank / Card';
+    case 'CASH':
+      return 'Cash';
+    case 'WALLET':
+      return 'Wallet';
+    default:
+      return code;
+  }
+}
+
 // Special dropdown value that opens the "New category" dialog
 const String _kNewCategory = '__new_category__';
 
@@ -468,7 +486,7 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
                   children: kSources.map((s) {
                     final selected = srcs.contains(s);
                     return FilterChip(
-                      label: Text(s),
+                      label: Text(sourceLabel(s)),
                       selected: selected,
                       selectedColor: const Color(0xFF5B2EFF).withOpacity(0.15),
                       checkmarkColor: const Color(0xFF5B2EFF),
@@ -747,7 +765,7 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
                     style: const TextStyle(color: Color(0xFF1A1A2E)),
                     decoration: _inputStyle('Payment Method'),
                     items: kSources
-                        .map((s) => DropdownMenuItem(value: s, child: Text(s)))
+                        .map((s) => DropdownMenuItem(value: s, child: Text(sourceLabel(s))))
                         .toList(),
                     onChanged: (v) => setModal(() => source = v!),
                   ),
@@ -1124,7 +1142,7 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
                         color: _sourceColor(source).withOpacity(0.12),
                         borderRadius: BorderRadius.circular(6),
                       ),
-                      child: Text(source,
+                      child: Text(sourceLabel(source),
                           style: TextStyle(
                               color: _sourceColor(source),
                               fontSize: 10,
