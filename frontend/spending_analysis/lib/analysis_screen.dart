@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'api_service.dart';
 import 'app_events.dart';
+import 'transactions_screen.dart' show sourceLabel;
 
 class AnalysisScreen extends StatefulWidget {
   final int userId;
@@ -1032,7 +1033,7 @@ class _AnomaliesTabState extends State<_AnomaliesTab> {
                                         color: Colors.black45, fontSize: 12)),
                                 if (source.isNotEmpty) ...[
                                   const SizedBox(width: 8),
-                                  Text(source,
+                                  Text(sourceLabel(source),
                                       style: const TextStyle(
                                           color: Colors.black38,
                                           fontSize: 11)),

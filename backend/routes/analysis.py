@@ -395,7 +395,7 @@ def run_clustering(df: pd.DataFrame, period_start=None) -> dict:
 
 
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-SOURCE_LABELS = {"MPESA": "M-Pesa", "CARD": "card", "CASH": "cash", "WALLET": "wallet"}
+SOURCE_LABELS = {"MPESA": "mobile money", "CARD": "bank or card", "CASH": "cash", "WALLET": "wallet"}
 
 
 PARTS_OF_DAY = [  # (name, from hour, to hour)
@@ -520,7 +520,7 @@ def describe_clusters(featured_df: pd.DataFrame) -> dict:
             "part_of_day": part_of_day or None,
             "part_of_day_pct": round(part_pct, 1) if part_of_day else None,
             "typical_time": _typical_time(timed) if enough_times else None,
-            "main_source": SOURCE_LABELS.get(str(g["source"].mode().iloc[0]).upper(), "M-Pesa"),
+            "main_source": SOURCE_LABELS.get(str(g["source"].mode().iloc[0]).upper(), "mobile money"),
             "top_category": top_categories[0]["name"] if top_categories else "Other",
             "top_categories": top_categories,
             "top_merchants": top_merchants,
