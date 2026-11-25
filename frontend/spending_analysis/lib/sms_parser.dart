@@ -107,6 +107,13 @@ class SmsParser {
   // M-Shwari and Ziidi messages are savings and investment moves, not spending.
   static final _rSavings = RegExp(r'm[\s-]?shwari|ziidi', caseSensitive: false);
 
+  // Adverts and notices about charges or offers, not transactions
+  // (e.g. "KES 30 plus excise duty across all I&M Bank payment channels").
+  // Only checked for messages that no known format matched.
+  static final _rPromo = RegExp(
+      r'excise duty|\bT\s?&\s?Cs?\b|terms and conditions|\benjoy\b|\boffers?\b|\bpromo(?:tion)?\b|\bdial\s*\*|\bdownload\b|did you know|now you can',
+      caseSensitive: false);
+
   // Fallback for bank alerts we have not seen before
   static final _rAnyAmount =
       RegExp(r'(?:kes|ksh)\s?([\d,]+(?:\.\d+)?)', caseSensitive: false);
@@ -308,6 +315,7 @@ class SmsParser {
   }
 
   static ParsedSms? _generic(String text, DateTime today, String source) {
+    if (_rPromo.hasMatch(text)) return null;
     final amt = _rAnyAmount.firstMatch(text);
     if (amt == null) return null;
     if (!_rDebitWord.hasMatch(text) || _rCreditWord.hasMatch(text)) return null;
@@ -327,7 +335,8 @@ class SmsParser {
     String? merchant;
     for (final m in _rAtMerchant.allMatches(text)) {
       final cand = _cleanName(m.group(1)!.trim());
-      if (cand.isNotEmpty && !_rNotAName.hasMatch(cand)) {
+      if (cand.isNotEmpty && !_rNotAName.hasMatch(cand) &&
+          !RegExp(r'^(?:kes|ksh)\s?\d', caseSensitive: false).hasMatch(cand)) {
         merchant = cand;
         break;
       }
